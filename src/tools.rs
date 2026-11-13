@@ -34,7 +34,7 @@ pub fn definitions() -> Vec<Value> {
                 json!({
                     "width": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Screen width in pixels (default 1280)" },
                     "height": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Screen height in pixels (default 800)" },
-                    "backend": { "type": "string", "enum": ["x11", "wayland"], "description": "Display backend (default x11). wayland uses sway and exposes capture, window control, and resize; input and clipboard are not wired yet." },
+                    "backend": { "type": "string", "enum": ["x11", "wayland"], "description": "Display backend (default x11). wayland uses sway and exposes capture, window control, resize, virtual-device pointer/keyboard input, and the data-control clipboard." },
                     "visible": { "type": "boolean", "description": "Open a window on the host desktop (true, default) or run headless (false)" },
                     "xwayland": { "type": "boolean", "description": "wayland only: start XWayland so X11-only apps get a DISPLAY (default false; adds a host-global /tmp/.X11-unix socket)" },
                     "session_id": { "type": "string", "description": "Optional caller-supplied identifier (1-64 letters/digits/-_.). Used by the viewer and to keep multiple server instances apart. Generated if omitted." },
@@ -156,7 +156,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "click",
-            "Move the nested pointer and click. Pass x/y in display pixels, or mark from the last screenshot with marks=true. count>1 gives double/triple clicks; modifiers holds ctrl/shift/alt/super for the click. Uses XTEST on the nested server; the host cursor is untouched. Call focus_window first when the target window is not focused.",
+            "Move the nested pointer and click. Pass x/y in display pixels, or mark from the last screenshot with marks=true. count>1 gives double/triple clicks; modifiers holds ctrl/shift/alt/super for the click. Uses XTEST on X11 and a compositor virtual pointer on Wayland; the host cursor is untouched. Call focus_window first when the target window is not focused.",
             schema(
                 json!({
                     "x": { "type": "integer", "description": "Display X coordinate (omit when using mark)" },
@@ -254,7 +254,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "type",
-            "Type text into the focused window using XTEST. Supports Unicode and newlines; this is not a key-combo API (use key for shortcuts).",
+            "Type text into the focused window through the backend input path. Supports Unicode and newlines; this is not a key-combo API (use key for shortcuts).",
             schema(
                 json!({
                     "text": { "type": "string", "description": "Text to type" },
@@ -265,7 +265,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "key",
-            "Send a key combination to the focused window, e.g. 'Return', 'ctrl+l', 'alt+Tab', 'ctrl+shift+t'. Uses XTEST and clears held modifiers first.",
+            "Send a key combination to the focused window, e.g. 'Return', 'ctrl+l', 'alt+Tab', 'ctrl+shift+t'. Uses the backend input path and clears held modifiers first.",
             schema(
                 json!({
                     "combo": { "type": "string", "description": "xdotool key combo" },
@@ -281,7 +281,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "clipboard_set",
-            "Put text on the nested desktop's CLIPBOARD selection. Much more reliable than type for long or Unicode text, and it avoids per-character XTEST latency. Paste with key ctrl+v.",
+            "Put text on the nested desktop's CLIPBOARD selection. Much more reliable than type for long or Unicode text, and it avoids per-character input latency. Paste with key ctrl+v.",
             schema(
                 json!({
                     "text": { "type": "string", "description": "Text to place on the clipboard" }
@@ -457,7 +457,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "a11y_click",
-            "Activate an accessible element by name or by tree path. Invokes its click/press/activate/toggle action; if it has none, clicks its center with XTEST on non-GTK4 toolkits. Path targeting is the reliable option for GTK4 widgets, whose child positions are unreliable. Returns the matched node and how it was activated.",
+            "Activate an accessible element by name or by tree path. Invokes its click/press/activate/toggle action; if it has none, clicks its center through the backend pointer on non-GTK4 toolkits. Path targeting is the reliable option for GTK4 widgets, whose child positions are unreliable. Returns the matched node and how it was activated.",
             schema(
                 json!({
                     "name": { "type": "string", "description": "Accessible name (button label, menu item, field label, ...)" },
@@ -486,6 +486,183 @@ fn schema(properties: Value, required: &[&str]) -> Value {
         "required": required,
         "additionalProperties": false,
     })
+}
+
+/// Input is the one place where the two backends have genuinely different
+/// transports: xdotool/XTEST for X11 and compositor virtual devices for
+/// Wayland.  The tool handlers call these helpers so their bodies stay free of
+/// backend branching.
+async fn pointer_move_tool(
+    manager: &DisplayManager,
+    session: &Arc<Session>,
+    x: i32,
+    y: i32,
+) -> Result<Value> {
+    match session.backend.kind() {
+        BackendKind::X11 => {
+            let tool = xdotool(manager)?;
+            input::move_to(session, &tool, x, y).await
+        }
+        BackendKind::Wayland => {
+            let backend = session.backend();
+            tokio::task::spawn_blocking(move || backend.pointer_move(x, y))
+                .await
+                .context("pointer move task failed")?
+        }
+    }
+}
+
+async fn pointer_click_tool(
+    manager: &DisplayManager,
+    session: &Arc<Session>,
+    x: i32,
+    y: i32,
+    button: u32,
+    count: u32,
+    modifiers: &[String],
+) -> Result<Value> {
+    match session.backend.kind() {
+        BackendKind::X11 => {
+            let tool = xdotool(manager)?;
+            input::click(session, &tool, x, y, button, count, modifiers).await
+        }
+        BackendKind::Wayland => {
+            let backend = session.backend();
+            let modifiers = modifiers.to_vec();
+            tokio::task::spawn_blocking(move || {
+                backend.pointer_click(x, y, button, count, &modifiers)
+            })
+            .await
+            .context("click task failed")?
+        }
+    }
+}
+
+async fn pointer_button_tool(
+    manager: &DisplayManager,
+    session: &Arc<Session>,
+    at: Option<(i32, i32)>,
+    button: u32,
+    down: bool,
+) -> Result<Value> {
+    match session.backend.kind() {
+        BackendKind::X11 => {
+            let tool = xdotool(manager)?;
+            input::mouse_button(session, &tool, at, button, down).await
+        }
+        BackendKind::Wayland => {
+            let backend = session.backend();
+            tokio::task::spawn_blocking(move || backend.pointer_button(at, button, down))
+                .await
+                .context("mouse button task failed")?
+        }
+    }
+}
+
+async fn pointer_drag_tool(
+    manager: &DisplayManager,
+    session: &Arc<Session>,
+    from: (i32, i32),
+    to: (i32, i32),
+    button: u32,
+    duration_ms: u32,
+) -> Result<Value> {
+    match session.backend.kind() {
+        BackendKind::X11 => {
+            let tool = xdotool(manager)?;
+            input::drag(session, &tool, from, to, button, duration_ms).await
+        }
+        BackendKind::Wayland => {
+            let backend = session.backend();
+            tokio::task::spawn_blocking(move || backend.pointer_drag(from, to, button, duration_ms))
+                .await
+                .context("drag task failed")?
+        }
+    }
+}
+
+async fn pointer_scroll_tool(
+    manager: &DisplayManager,
+    session: &Arc<Session>,
+    at: Option<(i32, i32)>,
+    up: bool,
+    amount: u32,
+) -> Result<Value> {
+    match session.backend.kind() {
+        BackendKind::X11 => {
+            let tool = xdotool(manager)?;
+            input::scroll(session, &tool, at, up, amount).await
+        }
+        BackendKind::Wayland => {
+            let backend = session.backend();
+            tokio::task::spawn_blocking(move || backend.pointer_scroll(at, up, amount))
+                .await
+                .context("scroll task failed")?
+        }
+    }
+}
+
+async fn key_tool(
+    manager: &DisplayManager,
+    session: &Arc<Session>,
+    combo: &str,
+    delay_ms: u32,
+) -> Result<Value> {
+    match session.backend.kind() {
+        BackendKind::X11 => {
+            let tool = xdotool(manager)?;
+            input::key(session, &tool, combo, delay_ms).await
+        }
+        BackendKind::Wayland => {
+            let backend = session.backend();
+            let combo = combo.to_string();
+            tokio::task::spawn_blocking(move || backend.key_press(&combo, delay_ms))
+                .await
+                .context("key task failed")?
+        }
+    }
+}
+
+async fn key_hold_tool(
+    manager: &DisplayManager,
+    session: &Arc<Session>,
+    combo: &str,
+    down: bool,
+) -> Result<Value> {
+    match session.backend.kind() {
+        BackendKind::X11 => {
+            let tool = xdotool(manager)?;
+            input::key_hold(session, &tool, combo, down).await
+        }
+        BackendKind::Wayland => {
+            let backend = session.backend();
+            let combo = combo.to_string();
+            tokio::task::spawn_blocking(move || backend.key_hold(&combo, down))
+                .await
+                .context("key hold task failed")?
+        }
+    }
+}
+
+async fn type_tool(
+    manager: &DisplayManager,
+    session: &Arc<Session>,
+    text: &str,
+    delay_ms: u32,
+) -> Result<Value> {
+    match session.backend.kind() {
+        BackendKind::X11 => {
+            let tool = xdotool(manager)?;
+            input::type_text(session, &tool, text, delay_ms).await
+        }
+        BackendKind::Wayland => {
+            let backend = session.backend();
+            let text = text.to_string();
+            tokio::task::spawn_blocking(move || backend.type_text(&text, delay_ms))
+                .await
+                .context("type task failed")?
+        }
+    }
 }
 
 pub async fn call(manager: &DisplayManager, name: &str, args: &Value) -> CallResult {
@@ -904,8 +1081,8 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                 ),
             };
             session.require_pointer()?;
-            let tool = xdotool(manager)?;
-            let mut result = input::click(&session, &tool, x, y, button, count, &modifiers).await?;
+            let mut result =
+                pointer_click_tool(manager, &session, x, y, button, count, &modifiers).await?;
             if let Some(mark) = &target {
                 result["mark"] = json!(mark.mark);
                 result["via"] = json!("mark/xtest");
@@ -915,7 +1092,6 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         "mouse_down" | "mouse_up" => {
             let session = active(manager).await?;
             session.require_pointer()?;
-            let tool = xdotool(manager)?;
             let button = button_arg(args)?;
             let at = match (opt_i64(args, "x"), opt_i64(args, "y")) {
                 (Some(x), Some(y)) => Some((x as i32, y as i32)),
@@ -923,32 +1099,29 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                 _ => return Err(anyhow!("mouse_down/mouse_up need both x and y, or neither")),
             };
             Ok(CallResult::text(
-                &input::mouse_button(&session, &tool, at, button, name == "mouse_down").await?,
+                &pointer_button_tool(manager, &session, at, button, name == "mouse_down").await?,
             ))
         }
         "key_down" | "key_up" => {
             let session = active(manager).await?;
             session.require_keyboard()?;
-            let tool = xdotool(manager)?;
             let combo = required_str(args, "key")?;
             Ok(CallResult::text(
-                &input::key_hold(&session, &tool, combo, name == "key_down").await?,
+                &key_hold_tool(manager, &session, combo, name == "key_down").await?,
             ))
         }
         "move" => {
             let session = active(manager).await?;
             session.require_pointer()?;
-            let tool = xdotool(manager)?;
             let x = required_i64(args, "x")? as i32;
             let y = required_i64(args, "y")? as i32;
             Ok(CallResult::text(
-                &input::move_to(&session, &tool, x, y).await?,
+                &pointer_move_tool(manager, &session, x, y).await?,
             ))
         }
         "drag" => {
             let session = active(manager).await?;
             session.require_pointer()?;
-            let tool = xdotool(manager)?;
             let from = (
                 required_i64(args, "x1")? as i32,
                 required_i64(args, "y1")? as i32,
@@ -960,13 +1133,12 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             let button = button_arg(args)?;
             let duration = opt_u64(args, "duration_ms").unwrap_or(350).min(10000) as u32;
             Ok(CallResult::text(
-                &input::drag(&session, &tool, from, to, button, duration).await?,
+                &pointer_drag_tool(manager, &session, from, to, button, duration).await?,
             ))
         }
         "scroll" => {
             let session = active(manager).await?;
             session.require_pointer()?;
-            let tool = xdotool(manager)?;
             let amount = opt_u64(args, "amount").unwrap_or(3).clamp(1, 100) as u32;
             let direction = opt_str(args, "direction").unwrap_or("down");
             let up = match direction.to_ascii_lowercase().as_str() {
@@ -979,27 +1151,25 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                 _ => None,
             };
             Ok(CallResult::text(
-                &input::scroll(&session, &tool, at, up, amount).await?,
+                &pointer_scroll_tool(manager, &session, at, up, amount).await?,
             ))
         }
         "type" => {
             let session = active(manager).await?;
             session.require_keyboard()?;
-            let tool = xdotool(manager)?;
             let text = required_str(args, "text")?;
             let delay = opt_u64(args, "delay_ms").unwrap_or(12).min(1000) as u32;
             Ok(CallResult::text(
-                &input::type_text(&session, &tool, text, delay).await?,
+                &type_tool(manager, &session, text, delay).await?,
             ))
         }
         "key" => {
             let session = active(manager).await?;
             session.require_keyboard()?;
-            let tool = xdotool(manager)?;
             let combo = required_str(args, "combo")?;
             let delay = opt_u64(args, "delay_ms").unwrap_or(12).min(1000) as u32;
             Ok(CallResult::text(
-                &input::key(&session, &tool, combo, delay).await?,
+                &key_tool(manager, &session, combo, delay).await?,
             ))
         }
         "wait_for" => {
@@ -1067,7 +1237,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                 "backend": session.backend.kind().as_str(),
                 "ok": true,
                 "length": length,
-                "note": "Selection ownership is served by a background thread for as long as the MCP server runs.",
+                "note": "Selection ownership is served in the background for as long as the session runs.",
             })))
         }
         "list_processes" => {
@@ -1770,7 +1940,7 @@ async fn diagnose(manager: &DisplayManager) -> Value {
         "notes": [
             "Xephyr/Xvfb are found in the bundled runtime tree even when they are absent from the host PATH.",
             "X servers do not implement -version; their path identifies the bundled build.",
-            "The nested desktop defaults to X11; backend=wayland uses sway with output capture, sway-IPC window control, and display resize. Wayland input and clipboard are not wired yet.",
+            "The nested desktop defaults to X11; backend=wayland uses sway with output capture, sway-IPC window control, display resize, virtual pointer/keyboard input, and the data-control clipboard.",
             "AT-SPI requires PyGObject in the python3 environment (python_atspi).",
             "XEPHYR_MCP_IDLE_TIMEOUT_SECS and XEPHYR_MCP_MAX_LIFETIME_SECS enable the auto-teardown watchdog.",
             "Set persist_home=true to keep app profiles across display_stop/display_start with the same session_id.",

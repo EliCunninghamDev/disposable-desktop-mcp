@@ -21,9 +21,12 @@ pub mod sway;
 pub mod tools;
 pub mod trace;
 pub mod viewer;
+pub mod vk;
 pub mod wait;
 pub mod wayland;
 pub mod windows;
+pub mod wl_clipboard;
+pub mod wl_input;
 pub mod x11;
 
 pub use display::DisplayManager;

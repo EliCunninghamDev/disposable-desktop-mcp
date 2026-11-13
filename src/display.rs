@@ -1031,6 +1031,10 @@ impl DisplayManager {
 
         // Ask sway to exit before signalling the group: that gives clients a
         // chance to shut down and removes the compositor's sockets cleanly.
+        if let Some(display) = info.wayland_display.clone() {
+            crate::wl_input::disconnect(&info.runtime_dir, &display);
+            crate::wl_clipboard::disconnect(&info.runtime_dir, &display);
+        }
         if let Some(socket) = info.swaysock.clone() {
             let _ = tokio::task::spawn_blocking(move || {
                 let _ = sway::Sway::new(socket).run("exit");

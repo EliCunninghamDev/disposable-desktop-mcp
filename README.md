@@ -1,10 +1,11 @@
 # xephyr-mcp
 
-An MCP server that gives an agent its own private X11 desktop, plus a live
-GTK4 viewer for watching it. Everything the agent launches runs inside a nested
-Xephyr (visible) or Xvfb (headless) display with its own window manager, D-Bus
-session bus, accessibility bus, and runtime directory. Host input, host windows,
-and the host session bus are never used.
+An MCP server that gives an agent its own private desktop, plus a live GTK4
+viewer for watching it. X11 (the default) uses a nested Xephyr (visible) or Xvfb
+(headless) display with openbox; Wayland uses sway, headless or nested on the
+host compositor. Both get a private D-Bus session bus, accessibility bus, and
+runtime directory. Host input, host windows, and the host session bus are never
+used.
 
 ```
 ┌──────────────┐   stdio JSON-RPC   ┌──────────────────────────────┐
@@ -34,18 +35,20 @@ and the host session bus are never used.
 - **Pure-Rust screenshots.** `GetImage` + PNG encoding, with region/window
   crops, optional cursor and coordinate-grid overlays, and downscaling for
   token-efficient full-screen captures.
-- **Input through XTEST on the nested server.** Mouse moves/clicks/drags,
-  scrolling, typing, and key combos never touch the host pointer.
-- **EWMH window management.** List, focus, move/resize, and close windows
-  directly over X11.
+- **Input that never reaches the host.** X11 uses XTEST on the nested server;
+  Wayland uses compositor virtual pointer and keyboard devices. Mouse
+  moves/clicks/drags, scrolling, typing, held keys, and key combos all stay
+  inside the session.
+- **Window management.** EWMH over X11 and sway IPC over Wayland for listing,
+  focusing, moving/resizing floating windows, and closing windows.
 - **Accessibility via AT-SPI.** Query the tree by name/role, activate by
   accessible name, focus elements, and set editable text.
 - **Settling primitives.** `wait_for_idle` and `wait_for` block on frame
   stability, window appearance, process exit, changed regions, or files,
   instead of making agents poll screenshots.
-- **Clipboard and process tools.** In-process CLIPBOARD ownership avoids
-  per-character typing, and session-scoped process/log tools make failed
-  launches diagnosable.
+- **Clipboard and process tools.** X11 owns CLIPBOARD in-process; Wayland uses
+  the data-control protocol with a background owner. Session-scoped process/log
+  tools make failed launches diagnosable.
 - **Runtime control.** XRandR resizing on Xephyr, EWMH window state changes,
   held mouse/key input, persistent per-session HOME, and an auto-teardown
   watchdog.
@@ -108,13 +111,17 @@ Implemented on this backend:
   and confirmation polling. Tiled windows return an explicit error instead of
   silently reflowing the desktop;
 - `resize_display` through `output <name> mode`;
+- pointer and keyboard injection through `zwlr_virtual_pointer_v1` and
+  `zwp_virtual_keyboard_v1`, including key holds and Unicode text via a
+  generated per-chunk keymap. No ydotool or `/dev/uinput` is involved;
+- clipboard get/set through `zwlr_data_control_v1`, with a worker thread that
+  keeps serving `send` requests while the session owns the selection;
 - optional `xwayland=true` for X11-only apps.
 
-Pointer/keyboard injection and the data-control clipboard are the next phase, so
-this build reports `pointer: false`, `keyboard: false`, and `clipboard: "none"`
-for Wayland sessions and the input/clipboard tools return a capability error.
-The viewer is still X11-only. The protocol map, spike results, and acceptance
-tests are in [docs/wayland-backend.md](docs/wayland-backend.md).
+XWayland clients join the clipboard only after an X11 view has been focused at
+least once; that is a sway/wlroots bridge limitation, not a server policy. The
+viewer is still X11-only. The protocol map, spike results, and acceptance tests
+are in [docs/wayland-backend.md](docs/wayland-backend.md).
 
 ```json
 { "backend": "wayland", "visible": false, "width": 1024, "height": 768 }
@@ -218,7 +225,8 @@ tools return a clear error and the rest of the server keeps working.
 
 ## Limitations
 
-- Linux/X11 only. The viewer needs a host X11/XWayland display.
+- Linux only. The X11 backend needs Xephyr or Xvfb; the Wayland backend needs
+  sway. The viewer still needs a host X11/XWayland display.
 - The viewer is intentionally read-only; input passthrough is not implemented.
 - `launch` runs arbitrary shell commands inside the nested desktop. Treat the
   MCP server as trusted local tooling.
@@ -233,6 +241,11 @@ cargo test
 cargo clippy --all-targets
 cargo build --release
 ```
+
+The build links against `libxkbcommon` (for the Wayland keymap). Install the
+development package if it is missing, for example `libxkbcommon-dev` on Debian
+or Ubuntu. The compositor itself comes from the system or from
+`./scripts/fetch-runtime.sh --wayland`.
 
 The viewer's capture loop is a self-rescheduling low-priority GLib source: a
 slow `GetImage` tick can otherwise keep the main loop busy and starve GTK's

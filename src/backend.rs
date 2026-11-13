@@ -9,11 +9,12 @@
 use crate::display::SessionInfo;
 use crate::screenshot::{self, Frame};
 use crate::windows::WindowInfo;
-use crate::{clipboard, randr, sway, wayland, windows};
+use crate::{clipboard, randr, sway, wayland, windows, wl_clipboard, wl_input};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -86,19 +87,19 @@ impl Capabilities {
         }
     }
 
-    /// A sway session.  Output capture, sway IPC window control, and display
-    /// resize are implemented.  Wayland input and data-control clipboard are
-    /// the next phase, so they are reported honestly as unavailable.
+    /// A sway session.  Output capture, sway IPC window control, display
+    /// resize, and virtual-device input are implemented.  The data-control
+    /// clipboard is still reported honestly as unavailable.
     pub const fn wayland() -> Self {
         Self {
             move_resize: MoveResize::FloatingOnly,
             resize_display: true,
             capture_window: false,
-            clipboard: ClipboardPath::None,
+            clipboard: ClipboardPath::DataControl,
             precise_geometry: false,
             capture_output: true,
-            pointer: false,
-            keyboard: false,
+            pointer: true,
+            keyboard: true,
             window_list: true,
             window_activate: true,
             window_close: true,
@@ -549,11 +550,118 @@ impl Backend {
         }
     }
 
+    fn wayland_input(&self) -> Result<Arc<Mutex<wl_input::WaylandInput>>> {
+        match self {
+            Self::Wayland {
+                runtime_dir,
+                display,
+                swaysock,
+                output,
+            } => {
+                let expected = (!output.is_empty()).then_some(output.as_str());
+                let (width, height) = sway::output_size(swaysock, expected)?;
+                wl_input::shared(runtime_dir, display, width, height)
+            }
+            Self::X11 { .. } => bail!(
+                "internal error: virtual-device input is only available on the wayland backend"
+            ),
+        }
+    }
+
+    pub fn pointer_move(&self, x: i32, y: i32) -> Result<Value> {
+        self.require_pointer()?;
+        let input = self.wayland_input()?;
+        let mut guard = input
+            .lock()
+            .map_err(|_| anyhow!("the Wayland input state is poisoned"))?;
+        guard.move_to(x, y)
+    }
+
+    pub fn pointer_click(
+        &self,
+        x: i32,
+        y: i32,
+        button: u32,
+        count: u32,
+        modifiers: &[String],
+    ) -> Result<Value> {
+        self.require_pointer()?;
+        let input = self.wayland_input()?;
+        let mut guard = input
+            .lock()
+            .map_err(|_| anyhow!("the Wayland input state is poisoned"))?;
+        guard.click(x, y, button, count, modifiers)
+    }
+
+    pub fn pointer_button(&self, at: Option<(i32, i32)>, button: u32, down: bool) -> Result<Value> {
+        self.require_pointer()?;
+        let input = self.wayland_input()?;
+        let mut guard = input
+            .lock()
+            .map_err(|_| anyhow!("the Wayland input state is poisoned"))?;
+        guard.button_at(at, button, down)
+    }
+
+    pub fn pointer_drag(
+        &self,
+        from: (i32, i32),
+        to: (i32, i32),
+        button: u32,
+        duration_ms: u32,
+    ) -> Result<Value> {
+        self.require_pointer()?;
+        let input = self.wayland_input()?;
+        let mut guard = input
+            .lock()
+            .map_err(|_| anyhow!("the Wayland input state is poisoned"))?;
+        guard.drag(from, to, button, duration_ms)
+    }
+
+    pub fn pointer_scroll(&self, at: Option<(i32, i32)>, up: bool, amount: u32) -> Result<Value> {
+        self.require_pointer()?;
+        let input = self.wayland_input()?;
+        let mut guard = input
+            .lock()
+            .map_err(|_| anyhow!("the Wayland input state is poisoned"))?;
+        guard.scroll(at, up, amount)
+    }
+
+    pub fn key_press(&self, combo: &str, delay_ms: u32) -> Result<Value> {
+        self.require_keyboard()?;
+        let input = self.wayland_input()?;
+        let mut guard = input
+            .lock()
+            .map_err(|_| anyhow!("the Wayland input state is poisoned"))?;
+        guard.key_combo(combo, delay_ms)
+    }
+
+    pub fn key_hold(&self, combo: &str, down: bool) -> Result<Value> {
+        self.require_keyboard()?;
+        let input = self.wayland_input()?;
+        let mut guard = input
+            .lock()
+            .map_err(|_| anyhow!("the Wayland input state is poisoned"))?;
+        guard.key_hold(combo, down)
+    }
+
+    pub fn type_text(&self, text: &str, delay_ms: u32) -> Result<Value> {
+        self.require_keyboard()?;
+        let input = self.wayland_input()?;
+        let mut guard = input
+            .lock()
+            .map_err(|_| anyhow!("the Wayland input state is poisoned"))?;
+        guard.type_text(text, delay_ms)
+    }
+
     pub fn clipboard_get(&self) -> Result<String> {
         self.require_clipboard()?;
         match self {
             Self::X11 { display } => clipboard::get(display),
-            Self::Wayland { .. } => Err(self.capability_error("clipboard")),
+            Self::Wayland {
+                runtime_dir,
+                display,
+                ..
+            } => wl_clipboard::get(runtime_dir, display),
         }
     }
 
@@ -561,7 +669,11 @@ impl Backend {
         self.require_clipboard()?;
         match self {
             Self::X11 { display } => clipboard::set(display, text),
-            Self::Wayland { .. } => Err(self.capability_error("clipboard")),
+            Self::Wayland {
+                runtime_dir,
+                display,
+                ..
+            } => wl_clipboard::set(runtime_dir, display, text),
         }
     }
 }
@@ -583,11 +695,11 @@ mod tests {
     fn wayland_capabilities_are_honest() {
         let caps = Capabilities::wayland();
         assert_eq!(caps.move_resize, MoveResize::FloatingOnly);
-        assert_eq!(caps.clipboard, ClipboardPath::None);
+        assert_eq!(caps.clipboard, ClipboardPath::DataControl);
         assert!(!caps.capture_window);
         assert!(!caps.precise_geometry);
-        assert!(!caps.pointer);
-        assert!(!caps.keyboard);
+        assert!(caps.pointer);
+        assert!(caps.keyboard);
         assert!(caps.resize_display);
         assert!(caps.window_list);
     }

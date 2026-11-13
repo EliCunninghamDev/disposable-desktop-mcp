@@ -1,10 +1,9 @@
 # Wayland backend
 
-Status: phase 2 implemented and validated against sway 1.12 + wlroots 0.20
+Status: phase 3 implemented and validated against sway 1.12 + wlroots 0.20
 (2026-11-13). The `Backend` seam, headless/nested sway lifecycle, screencopy
-capture, sway-IPC window control, floating move/resize, and output-mode resize
-are live. Wayland pointer/keyboard injection and data-control clipboard are the
-next phase.
+capture, sway-IPC window control, floating move/resize, output-mode resize,
+virtual pointer/keyboard injection, and the data-control clipboard are live.
 
 The X11 backend stays the default. This document describes the seam that lets a
 Wayland session exist beside it, the protocol mapping, and the parts of the
@@ -391,10 +390,14 @@ host path (and host `DISPLAY`/`XAUTHORITY` for `WLR_BACKENDS=x11`).
    `display_stop` via `swaymsg exit` + group sweep. Screencopy capture reuses
    the existing fit/resize/PNG code. `display_start backend=wayland` (headless
    and nested), `resize_display` via output mode, optional XWayland.
-3. **Wayland windows and input.** Windows ✅ via sway IPC `get_tree`,
-   activate/close, floating-only move/resize with confirmation polling.
-   **Remaining:** `zwlr_virtual_pointer_v1` + `zwp_virtual_keyboard_v1`
-   injection and data-control clipboard.
+3. **Wayland windows and input.** ✅ Windows via sway IPC `get_tree`,
+   activate/close, floating-only move/resize with confirmation polling. ✅
+   Pointer and keyboard through `zwlr_virtual_pointer_v1` and
+   `zwp_virtual_keyboard_v1`; Unicode text uses a generated keysym keymap per
+   chunk, and `key_down`/`key_up` keep compositor state across calls. ✅
+   Clipboard get/set through `zwlr_data_control_v1`; a per-session worker
+   serves `send` requests and exits when the selection is replaced or the
+   session stops.
 4. **Viewer + control.** **Planned.** Screencopy client, state-based discovery,
    `c` toggle, `control` in state, server-side input refusal,
    `wait_for_control`, no trace screenshots during human control, optional

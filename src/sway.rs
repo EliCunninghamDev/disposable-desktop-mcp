@@ -482,6 +482,30 @@ pub fn action(socket: &Path, id: i64, action: &str) -> Result<Value> {
     }
 }
 
+/// Current size of one output, or of the first output when `output` is None.
+pub fn output_size(socket: &Path, output: Option<&str>) -> Result<(u32, u32)> {
+    let outputs = Sway::new(socket.to_path_buf()).get_outputs()?;
+    let list = outputs
+        .as_array()
+        .ok_or_else(|| anyhow!("sway returned a non-list for get_outputs"))?;
+    let item = match output {
+        Some(name) => list
+            .iter()
+            .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
+            .ok_or_else(|| anyhow!("sway no longer reports output {name:?}"))?,
+        None => list
+            .first()
+            .ok_or_else(|| anyhow!("sway reports no outputs"))?,
+    };
+    let rect = item.get("rect").cloned().unwrap_or_default();
+    let width = rect.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let height = rect.get("height").and_then(Value::as_u64).unwrap_or(0) as u32;
+    if width == 0 || height == 0 {
+        bail!("sway reports an empty output rect");
+    }
+    Ok((width, height))
+}
+
 pub fn resize_output(socket: &Path, output: &str, width: u32, height: u32) -> Result<Value> {
     if width < 64 || height < 64 {
         bail!("width and height must be at least 64 pixels");

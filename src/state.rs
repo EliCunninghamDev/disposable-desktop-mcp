@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(decoded.backend, "wayland");
         assert_eq!(
             decoded.capabilities.unwrap().clipboard,
-            crate::backend::ClipboardPath::None
+            crate::backend::ClipboardPath::DataControl
         );
     }
 }

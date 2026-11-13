@@ -238,6 +238,16 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for CaptureState {
     }
 }
 
+/// Millisecond timestamp for protocol requests.  The base is undefined, but
+/// every request from this process must share one clock.
+pub fn now_ms() -> u32 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_millis() as u32
+}
+
 /// Capture the whole output.  `cursor` asks the compositor to composite its
 /// pointer into the frame, which is the Wayland equivalent of the XFixes
 /// overlay.
