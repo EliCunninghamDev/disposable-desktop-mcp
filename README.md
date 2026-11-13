@@ -3,55 +3,62 @@
 An MCP server that gives an agent its own private desktop, plus a live GTK4
 viewer for watching it. X11 (the default) uses a nested Xephyr (visible) or Xvfb
 (headless) display with openbox; Wayland uses sway, headless or nested on the
-host compositor. Both get a private D-Bus session bus, accessibility bus, and
-runtime directory. Host input, host windows, and the host session bus are never
-used.
+host compositor. The backend is chosen per session, and both are driven through
+the same tool surface. Both get a private D-Bus session bus, accessibility bus,
+and runtime directory. Host input, host windows, and the host session bus are
+never used.
 
 ```
-┌──────────────┐   stdio JSON-RPC   ┌──────────────────────────────┐
-│ MCP client   │ ─────────────────► │ xephyr-mcp                   │
-│ (OpenCode)   │                    │  ├─ Xephyr / Xvfb  :100      │
-└──────────────┘                    │  ├─ openbox                  │
-                                    │  ├─ private dbus-daemon      │
-                                    │  ├─ AT-SPI bus (optional)    │
-                                    │  └─ launched applications    │
-                                    └──────────────┬───────────────┘
-                                                   │ GetImage + XTEST
-                                    ┌──────────────▼───────────────┐
-                                    │ xephyr-mcp-viewer (GTK4)     │
-                                    │  dropdown · Single · BSP     │
-                                    └──────────────────────────────┘
+┌──────────────┐   stdio JSON-RPC   ┌──────────────────────────────────────────────┐
+│ MCP client   │ ─────────────────► │ xephyr-mcp                                   │
+│ (OpenCode)   │                    │  X11:     Xephyr / Xvfb  :100                │
+└──────────────┘                    │           openbox · GetImage · XTEST         │
+                                    │  Wayland: sway (headless / nested)           │
+                                    │           screencopy · virtual input         │
+                                    │  both:    private dbus · AT-SPI · apps       │
+                                    └──────────────┬───────────────────────────────┘
+                                                   │ frames + forwarded input
+                                    ┌──────────────▼───────────────────────────────┐
+                                    │ xephyr-mcp-viewer (GTK4)                     │
+                                    │  dropdown · Single · BSP                     │
+                                    └──────────────────────────────────────────────┘
 ```
 
 ## Features
 
-- **Nested, disposable desktops.** `display_start` chooses a free display
-  number (`:100`–`:250`), starts Xephyr or Xvfb, a window manager, a private
-  D-Bus session bus, a private AT-SPI bus, and a fresh `XDG_RUNTIME_DIR` and
-  `XAUTHORITY`.
+- **Nested, disposable desktops.** `display_start` picks a free X11 display
+  (`:100`–`:250`) and starts Xephyr or Xvfb, openbox, a private D-Bus session
+  bus, a private AT-SPI bus, and a fresh `XDG_RUNTIME_DIR` and `XAUTHORITY`; or
+  it starts a headless/nested sway with its own runtime, socket, and buses.
 - **Multiple sessions.** Callers can pass `session_id` (`alpha`, `beta`, ...).
   Each server instance/session is tracked independently and the viewer can
   switch or tile between them.
-- **Pure-Rust screenshots.** `GetImage` + PNG encoding, with region/window
-  crops, optional cursor and coordinate-grid overlays, and downscaling for
-  token-efficient full-screen captures.
+- **Pure-Rust capture, both backends.** X11 reads pixels with `GetImage`;
+  Wayland uses `wlr-screencopy-v1` for outputs and `ext-image-copy-capture-v1`
+  for individual windows. The same PNG pipeline, region/window crops,
+  cursor/grid/marks overlays, and downscaling apply to either backend.
+  `screenshot window_id=` captures a single window even when another window
+  covers it.
 - **Input that never reaches the host.** X11 uses XTEST on the nested server;
   Wayland uses compositor virtual pointer and keyboard devices. Mouse
-  moves/clicks/drags, scrolling, typing, held keys, and key combos all stay
-  inside the session.
+  moves/clicks/drags, scrolling, typing, Unicode text, held keys, and key combos
+  all stay inside the session.
 - **Window management.** EWMH over X11 and sway IPC over Wayland for listing,
-  focusing, moving/resizing floating windows, and closing windows.
+  focusing, moving/resizing, changing state, and closing windows. Wayland can
+  move/resize floating windows exactly; tiled windows are rejected rather than
+  reflowing the desktop.
 - **Accessibility via AT-SPI.** Query the tree by name/role, activate by
   accessible name, focus elements, and set editable text.
 - **Settling primitives.** `wait_for_idle` and `wait_for` block on frame
   stability, window appearance, process exit, changed regions, or files,
   instead of making agents poll screenshots.
-- **Clipboard and process tools.** X11 owns CLIPBOARD in-process; Wayland uses
-  the data-control protocol with a background owner. Session-scoped process/log
-  tools make failed launches diagnosable.
-- **Runtime control.** XRandR resizing on Xephyr, EWMH window state changes,
-  held mouse/key input, persistent per-session HOME, an auto-teardown watchdog,
-  and explicit agent/human input arbitration with `wait_for_control`.
+- **Clipboard and process tools.** X11 owns CLIPBOARD in-process; Wayland serves
+  `zwlr_data_control_v1` selections from a background worker. Session-scoped
+  process/log tools make failed launches diagnosable.
+- **Runtime control.** XRandR resizing on Xephyr and `output mode` on sway, EWMH
+  and sway window state changes, held mouse/key input, persistent per-session
+  HOME, an auto-teardown watchdog, and explicit agent/human input arbitration
+  with `wait_for_control`.
 - **Trace and marks.** Every tool call is appended to
 `$XDG_RUNTIME_DIR/xephyr-mcp/traces/<session_id>.jsonl` with the sanitized
 arguments, duration, outcome, and before/after frame hashes for screen-changing
@@ -61,6 +68,27 @@ Set `XEPHYR_MCP_TRACE_SCREENSHOTS=1` to also save the before/after frame of each
 screen-changing call under `traces/steps/<session>/`. The trace entry then
 carries `before_shot` and `after_shot` paths; the newest 400 images per session
 are kept.
+
+## Backends at a glance
+
+| | X11 (default) | Wayland |
+| --- | --- | --- |
+| Nested visible desktop | Xephyr | sway, nested on the host Wayland or X11 session |
+| Headless desktop | Xvfb | sway, headless (`WLR_BACKENDS=headless`) |
+| Window manager | openbox | sway |
+| Output capture | `GetImage` | `wlr-screencopy-v1` |
+| Window capture | `GetImage` on the window | `ext-image-copy-capture-v1` |
+| Pointer/keyboard | XTEST | `zwlr_virtual_pointer_v1`, `zwp_virtual_keyboard_v1` |
+| Windows | EWMH | sway IPC |
+| Clipboard | X `CLIPBOARD` owner | `zwlr_data_control_v1` |
+| Resize display | XRandR (Xephyr only) | `output <name> mode` |
+| Move/resize windows | any window | floating windows only |
+| Cursor in window capture | yes (XFixes) | no (`cursor_drawn: false`) |
+
+Capabilities are reported per session by `display_start`, so a tool can check
+support instead of guessing from the backend name. Host input can still reach a
+visible Xephyr window directly, so prefer a headless X11 session when that
+matters; a nested sway session parks its host devices on a `locked` seat.
 
 ## Process lifetime
 
@@ -82,9 +110,11 @@ session id. Set `XEPHYR_MCP_IDLE_TIMEOUT_SECS` or
 `XEPHYR_MCP_MAX_LIFETIME_SECS` to enable the watchdog, which tears down a
 desktop when no tool call is active and the limit has elapsed.
 
-The clipboard tools own the X `CLIPBOARD` selection directly (a background
-thread answers `SelectionRequest`); the host clipboard is never used. Direct
-selection transfer is limited to 1 MiB per set.
+The clipboard tools own the selection directly: on X11 a background thread
+answers `SelectionRequest` for `CLIPBOARD`, and on Wayland a
+`zwlr_data_control_v1` worker serves `send` requests while the session owns the
+selection. The host clipboard is never read or written. X11 selection transfer
+is limited to 1 MiB per `clipboard_set`.
 
 `list_processes` matches processes by their private `XDG_RUNTIME_DIR`, and
 `kill_process` refuses PIDs that do not belong to the session, so it cannot
@@ -120,11 +150,13 @@ Implemented on this backend:
   generated per-chunk keymap. No ydotool or `/dev/uinput` is involved;
 - clipboard get/set through `zwlr_data_control_v1`, with a worker thread that
   keeps serving `send` requests while the session owns the selection;
-- optional `xwayland=true` for X11-only apps.
+- optional `xwayland=true` for X11-only apps; this is off by default because it
+  creates a host-global `/tmp/.X11-unix` socket.
 
 XWayland clients join the clipboard only after an X11 view has been focused at
 least once; that is a sway/wlroots bridge limitation, not a server policy. The
-viewer is still X11-only. The protocol map, spike results, and acceptance tests
+viewer can watch Wayland sessions, but it is still an X11/XWayland client and
+needs a host X display. The protocol map, spike results, and acceptance tests
 are in [docs/wayland-backend.md](docs/wayland-backend.md).
 
 ```json
@@ -165,20 +197,23 @@ The toolbar contains:
 - **BSP `N`** — tile up to eight live sessions with a balanced binary split.
 
 Selecting a session in BSP mode switches back to Single for that session.
-Keyboard shortcuts: `q`/`Esc` quit, `f`/`F11` fullscreen, `t` toggle BSP,
-`s` cycle sessions. The viewer is read-only by default. Press `c` or the
-**Control** toggle to claim human control: mouse, wheel, and keyboard events
-are then forwarded to the selected session (including `Esc`), the title shows
-`[HUMAN]`, and the MCP server refuses agent input until you press
-`Ctrl+Shift+C`, click **Control** again, or close the viewer. `Ctrl+Shift+Q`
-closes it while human control is active. Claims are tied to the viewer PID, so
-a crashed viewer cannot lock an agent out.
+While the agent owns control, the keyboard shortcuts are `q`/`Esc` quit,
+`f`/`F11` fullscreen, `t` toggle BSP, and `s` cycle sessions. Click the image
+once so the canvas has keyboard focus if a shortcut does not respond.
 
-Wayland sessions (including headless ones) are captured with the same
-screencopy path as the server and receive forwarded input through the virtual
-pointer/keyboard. A nested Wayland session parks its host input devices on a
-dummy seat while the agent owns it and moves them back only during human
-control.
+The viewer is read-only by default. Press `c` or the **Control** toggle to claim
+human control: mouse, wheel, and keyboard events are then forwarded to the
+selected session (including `Esc`), the title shows `[HUMAN]`, and the MCP
+server refuses agent input until you press `Ctrl+Shift+C`, click **Control**
+again, or close the viewer. While human control is active every key goes to the
+session, so press `Ctrl+Shift+C` to release and get the shortcuts above back.
+`Ctrl+Shift+Q` closes the viewer while human control is active. Claims are tied
+to the viewer PID, so a crashed viewer cannot lock an agent out.
+
+Wayland sessions (including headless ones) are captured through the output
+screencopy path and receive forwarded input through the virtual pointer and
+keyboard. A nested Wayland session parks its host input devices on a dummy seat
+while the agent owns it and moves them back only during human control.
 
 The window is aspect-ratio-locked in Single mode via `WM_NORMAL_HINTS` when it
 runs on X11 (the default when an X display is reachable). Content is always
@@ -210,13 +245,15 @@ not, replace the `Exec=` and `TryExec=` lines with the absolute binary path.
 
 `display_start` builds a scrubbed environment for every nested process:
 
-- `DISPLAY` points at the new nested server;
-- `WAYLAND_DISPLAY`, `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`, and the host
-  runtime directory are removed or replaced;
+- `DISPLAY` points at the new nested X server; on Wayland it is absent unless
+  `xwayland=true`;
+- `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` point at the private compositor for
+  `backend="wayland"`; host `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`, and the
+  host runtime directory are removed or replaced;
 - `XDG_RUNTIME_DIR` is a fresh directory under `/run/user/<uid>/xephyr-mcp/`;
 - a private `dbus-daemon --session` and an AT-SPI bus are started;
-- Xephyr/Xvfb, openbox, the bus daemons, and launched applications are placed
-  in their own process groups.
+- Xephyr/Xvfb and openbox, or sway, plus the bus daemons and launched
+  applications, are placed in their own process groups.
 
 `display_stop` terminates the groups, then verifies no processes remain. If the
 server dies unexpectedly, the next start finds the stale state file, inspects
@@ -241,10 +278,14 @@ tools return a clear error and the rest of the server keeps working.
 ## Limitations
 
 - Linux only. The X11 backend needs Xephyr or Xvfb; the Wayland backend needs
-  sway. The viewer still needs a host X11/XWayland display.
+  sway and the wlroots protocols listed above. The viewer still needs a host
+  X11/XWayland display.
 - The viewer forwards input only after explicit human control; X11 host input
   still reaches a visible Xephyr window directly, so use `visible=false` when
-  that matters.
+  that matters. A nested Wayland session can park its host devices on a
+  `locked` seat instead.
+- Wayland windows are moved/resized only while floating; tiled windows return an
+  error. Per-window capture never includes the compositor cursor.
 - `launch` runs arbitrary shell commands inside the nested desktop. Treat the
   MCP server as trusted local tooling.
 - Software rendering (GTK's Cairo renderer) is used automatically on hosts

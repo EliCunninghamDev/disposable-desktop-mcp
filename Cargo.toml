@@ -3,7 +3,7 @@ name = "xephyr-mcp"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-description = "MCP server driving a nested Xephyr/Xvfb desktop, plus an aspect-locked live viewer"
+description = "MCP server driving a private X11 (Xephyr/Xvfb) or Wayland (sway) desktop, plus a live viewer"
 license = "MIT"
 
 [dependencies]
