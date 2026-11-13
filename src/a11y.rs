@@ -165,3 +165,115 @@ pub async fn click(
     value["display"] = json!(session.info.display);
     Ok(value)
 }
+
+#[allow(clippy::too_many_arguments)]
+pub async fn find(
+    session: &Session,
+    python: Option<&Tool>,
+    name: Option<&str>,
+    role: Option<&str>,
+    exact: bool,
+    limit: u32,
+    max_depth: u32,
+    max_nodes: u32,
+) -> Result<Value> {
+    let python =
+        python.ok_or_else(|| anyhow!("python3 with PyGObject is required for a11y_find"))?;
+    let mut args = vec![
+        "find".to_string(),
+        "--max-depth".to_string(),
+        max_depth.clamp(1, 64).to_string(),
+        "--max-nodes".to_string(),
+        max_nodes.clamp(1, 4000).to_string(),
+        "--limit".to_string(),
+        limit.clamp(1, 100).to_string(),
+    ];
+    if let Some(name) = name {
+        args.push("--name".into());
+        args.push(name.to_string());
+    }
+    if let Some(role) = role {
+        args.push("--role".into());
+        args.push(role.to_string());
+    }
+    if exact {
+        args.push("--exact".into());
+    }
+    let mut value = run_helper(session, python, &args).await?;
+    value["display"] = json!(session.info.display);
+    if let Some(warning) = a11y_warning(session) {
+        value["warning"] = warning;
+    }
+    Ok(value)
+}
+
+pub async fn set_text(
+    session: &Session,
+    python: Option<&Tool>,
+    name: &str,
+    role: Option<&str>,
+    index: u32,
+    text: &str,
+) -> Result<Value> {
+    let python =
+        python.ok_or_else(|| anyhow!("python3 with PyGObject is required for a11y_set_text"))?;
+    let mut args = vec![
+        "set_text".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+        "--index".to_string(),
+        index.to_string(),
+        format!("--text={text}"),
+    ];
+    if let Some(role) = role {
+        args.push("--role".into());
+        args.push(role.to_string());
+    }
+    let mut value = run_helper(session, python, &args).await?;
+    value["display"] = json!(session.info.display);
+    if let Some(warning) = a11y_warning(session) {
+        value["warning"] = warning;
+    }
+    Ok(value)
+}
+
+pub async fn focus(
+    session: &Session,
+    python: Option<&Tool>,
+    name: Option<&str>,
+    role: Option<&str>,
+    index: u32,
+) -> Result<Value> {
+    let python =
+        python.ok_or_else(|| anyhow!("python3 with PyGObject is required for a11y_focus"))?;
+    let mut args = vec![
+        "focus".to_string(),
+        "--index".to_string(),
+        index.to_string(),
+    ];
+    if let Some(name) = name {
+        args.push("--name".into());
+        args.push(name.to_string());
+    }
+    if let Some(role) = role {
+        args.push("--role".into());
+        args.push(role.to_string());
+    }
+    let mut value = run_helper(session, python, &args).await?;
+    value["display"] = json!(session.info.display);
+    if let Some(warning) = a11y_warning(session) {
+        value["warning"] = warning;
+    }
+    Ok(value)
+}
+
+fn a11y_warning(session: &Session) -> Option<Value> {
+    if session.info.a11y_ready {
+        None
+    } else {
+        Some(json!(
+            "AT-SPI was not confirmed enabled for this display; if no applications appear, \
+             restart the display with a working at-spi2-registryd"
+        ))
+    }
+}

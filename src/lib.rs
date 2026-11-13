@@ -7,6 +7,7 @@
 //! management paths.
 
 pub mod a11y;
+pub mod clipboard;
 pub mod display;
 pub mod env;
 pub mod input;
@@ -16,6 +17,7 @@ pub mod screenshot;
 pub mod state;
 pub mod tools;
 pub mod viewer;
+pub mod wait;
 pub mod windows;
 pub mod x11;
 

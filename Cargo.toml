@@ -2,7 +2,7 @@
 name = "xephyr-mcp"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "MCP server driving a nested Xephyr/Xvfb desktop, plus an aspect-locked live viewer"
 license = "MIT"
 
@@ -13,6 +13,7 @@ gdk4-x11 = "0.9"
 gtk4 = { version = "0.9", features = ["v4_10"] }
 libc = "0.2"
 png = "0.17"
+rmcp = { version = "3.10", default-features = false, features = ["server", "transport-io"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = [
@@ -26,7 +27,7 @@ tokio = { version = "1", features = [
     "time",
     "signal",
 ] }
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["xfixes"] }
 
 [profile.release]
 lto = "thin"

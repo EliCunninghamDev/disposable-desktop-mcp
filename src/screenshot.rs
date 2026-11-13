@@ -46,9 +46,62 @@ pub fn capture_from(conn: &RustConnection, screen_num: usize) -> Result<Frame> {
     if width == 0 || height == 0 {
         return Err(anyhow!("nested display has an empty root window"));
     }
+    capture_drawable(conn, screen.root, 0, 0, width, height)
+}
 
+/// Capture an axis-aligned region of the root window.
+pub fn capture_region(display: &str, x: u16, y: u16, width: u16, height: u16) -> Result<Frame> {
+    if width == 0 || height == 0 {
+        return Err(anyhow!("capture region must not be empty"));
+    }
+    let (conn, screen_num) = x11rb::connect(Some(display))
+        .with_context(|| format!("cannot connect to nested display {display}"))?;
+    let screen = &conn.setup().roots[screen_num];
+    if u32::from(x) + u32::from(width) > u32::from(screen.width_in_pixels)
+        || u32::from(y) + u32::from(height) > u32::from(screen.height_in_pixels)
+    {
+        return Err(anyhow!(
+            "region {x},{y} {width}x{height} is outside the {}x{} display",
+            screen.width_in_pixels,
+            screen.height_in_pixels
+        ));
+    }
+    capture_drawable(&conn, screen.root, x, y, width, height)
+}
+
+/// Capture a window's own pixels (not the part of the root behind it).
+pub fn capture_window(display: &str, window: u32) -> Result<Frame> {
+    let (conn, _screen_num) = x11rb::connect(Some(display))
+        .with_context(|| format!("cannot connect to nested display {display}"))?;
+    let geometry = conn
+        .get_geometry(window)
+        .context("GetGeometry failed")?
+        .reply()
+        .context("window does not exist or is not a drawable")?;
+    if geometry.width == 0 || geometry.height == 0 {
+        return Err(anyhow!("window {window} has an empty geometry"));
+    }
+    capture_drawable(&conn, window, 0, 0, geometry.width, geometry.height)
+}
+
+fn capture_drawable(
+    conn: &RustConnection,
+    drawable: u32,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+) -> Result<Frame> {
     let reply = conn
-        .get_image(ImageFormat::Z_PIXMAP, screen.root, 0, 0, width, height, !0)
+        .get_image(
+            ImageFormat::Z_PIXMAP,
+            drawable,
+            i16::try_from(x).unwrap_or(i16::MAX),
+            i16::try_from(y).unwrap_or(i16::MAX),
+            width,
+            height,
+            !0,
+        )
         .context("GetImage failed")?
         .reply()
         .context("GetImage returned an error")?;
@@ -67,6 +120,8 @@ pub fn capture_from(conn: &RustConnection, screen_num: usize) -> Result<Frame> {
         ));
     }
 
+    // A window (unlike the root) can use a visual other than the root visual,
+    // so pick any visual with the reply's depth and use its channel masks.
     let visual = conn
         .setup()
         .roots
@@ -74,8 +129,8 @@ pub fn capture_from(conn: &RustConnection, screen_num: usize) -> Result<Frame> {
         .flat_map(|s| s.allowed_depths.iter())
         .filter(|d| d.depth == reply.depth)
         .flat_map(|d| d.visuals.iter())
-        .find(|v| v.visual_id == screen.root_visual)
-        .ok_or_else(|| anyhow!("cannot find the root visual for depth {}", reply.depth))?;
+        .find(|v| v.red_mask != 0 || v.green_mask != 0 || v.blue_mask != 0)
+        .ok_or_else(|| anyhow!("cannot find a visual for depth {}", reply.depth))?;
 
     let (red_mask, green_mask, blue_mask) = (visual.red_mask, visual.green_mask, visual.blue_mask);
 
@@ -222,6 +277,186 @@ pub fn resize(frame: &Frame, dst_width: u32, dst_height: u32) -> Vec<u8> {
     out
 }
 
+/// Crop a region from a frame.  The region is clamped to the frame bounds;
+/// an empty result is an error.
+pub fn crop(frame: &Frame, x: u32, y: u32, width: u32, height: u32) -> Result<Frame> {
+    let x = x.min(frame.width.saturating_sub(1));
+    let y = y.min(frame.height.saturating_sub(1));
+    let right = (x + width).min(frame.width);
+    let bottom = (y + height).min(frame.height);
+    let width = right.saturating_sub(x);
+    let height = bottom.saturating_sub(y);
+    if width == 0 || height == 0 {
+        return Err(anyhow!("crop region is outside the captured frame"));
+    }
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for row in y..y + height {
+        let start = ((row * frame.width + x) * 4) as usize;
+        let end = start + (width * 4) as usize;
+        rgba.extend_from_slice(&frame.rgba[start..end]);
+    }
+    Ok(Frame {
+        width,
+        height,
+        rgba,
+    })
+}
+
+/// Cheap content hash used by the wait tools.  FNV-1a is fast enough to run
+/// over a full frame every poll and has no collision concerns for change
+/// detection.
+pub fn hash(frame: &Frame) -> u64 {
+    let mut value: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in &frame.rgba {
+        value ^= u64::from(*byte);
+        value = value.wrapping_mul(0x1000_0000_01b3);
+    }
+    value
+}
+
+/// Cursor overlay source.  XFixes gives the real cursor image; some minimal
+/// servers (notably Xvfb) reject `GetCursorImage`, in which case a high
+/// contrast crosshair at the pointer position is drawn instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorMethod {
+    Xfixes,
+    Crosshair,
+}
+
+/// Draw the pointer onto a frame.  `origin_x`/`origin_y` are the root
+/// coordinates of the frame's top-left corner (0,0 for a full-screen capture).
+pub fn overlay_cursor(
+    display: &str,
+    frame: &mut Frame,
+    origin_x: i32,
+    origin_y: i32,
+) -> Result<Option<CursorMethod>> {
+    let (conn, _screen_num) = x11rb::connect(Some(display))
+        .with_context(|| format!("cannot connect to nested display {display}"))?;
+
+    if let Ok(cookie) = x11rb::protocol::xfixes::get_cursor_image(&conn) {
+        if let Ok(reply) = cookie.reply() {
+            if reply.width == 0 || reply.height == 0 || reply.cursor_image.is_empty() {
+                return fallback_crosshair(&conn, frame, origin_x, origin_y);
+            }
+            let cursor_width = i32::from(reply.width);
+            let base_x = i32::from(reply.x) - i32::from(reply.xhot) - origin_x;
+            let base_y = i32::from(reply.y) - i32::from(reply.yhot) - origin_y;
+
+            for (index, pixel) in reply.cursor_image.iter().enumerate() {
+                let alpha = (pixel >> 24) & 0xff;
+                if alpha == 0 {
+                    continue;
+                }
+                let x = base_x + (index as i32 % cursor_width);
+                let y = base_y + (index as i32 / cursor_width);
+                if x < 0 || y < 0 || x >= frame.width as i32 || y >= frame.height as i32 {
+                    continue;
+                }
+                let src = [(pixel >> 16) & 0xff, (pixel >> 8) & 0xff, pixel & 0xff];
+                let offset = ((y as u32 * frame.width + x as u32) * 4) as usize;
+                for (channel, source) in src.iter().enumerate() {
+                    let dst = frame.rgba[offset + channel] as u32;
+                    frame.rgba[offset + channel] =
+                        ((source * alpha + dst * (255 - alpha)) / 255) as u8;
+                }
+                frame.rgba[offset + 3] = 255;
+            }
+            return Ok(Some(CursorMethod::Xfixes));
+        }
+    }
+
+    fallback_crosshair(&conn, frame, origin_x, origin_y)
+}
+
+fn fallback_crosshair(
+    conn: &RustConnection,
+    frame: &mut Frame,
+    origin_x: i32,
+    origin_y: i32,
+) -> Result<Option<CursorMethod>> {
+    let root = conn.setup().roots[0].root;
+    let pointer = conn.query_pointer(root)?.reply()?;
+    let x = i32::from(pointer.root_x) - origin_x;
+    let y = i32::from(pointer.root_y) - origin_y;
+    if x < 0 || y < 0 || x >= frame.width as i32 || y >= frame.height as i32 {
+        return Ok(None);
+    }
+    let arm = 9i32;
+    for offset in -arm..=arm {
+        for (px, py) in [(x + offset, y), (x, y + offset)] {
+            if px >= 0 && py >= 0 && px < frame.width as i32 && py < frame.height as i32 {
+                blend(frame, px as u32, py as u32, (255, 255, 255), 0.85);
+            }
+        }
+    }
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let px = x + dx;
+            let py = y + dy;
+            if px >= 0 && py >= 0 && px < frame.width as i32 && py < frame.height as i32 {
+                blend(frame, px as u32, py as u32, (235, 64, 52), 0.95);
+            }
+        }
+    }
+    Ok(Some(CursorMethod::Crosshair))
+}
+
+/// Draw a 100 px coordinate grid over the frame, with stronger lines every
+/// 500 px.  Alpha blending keeps the underlying UI readable.
+pub fn overlay_grid(frame: &mut Frame, spacing: u32) {
+    let spacing = spacing.clamp(10, 1000);
+    let major = spacing.saturating_mul(5);
+    for x in (0..frame.width).step_by(spacing as usize) {
+        let (color, alpha) = if x % major == 0 {
+            ((90, 150, 240), 0.55)
+        } else {
+            ((110, 140, 190), 0.25)
+        };
+        draw_line(frame, x, 0, x, frame.height, color, alpha);
+    }
+    for y in (0..frame.height).step_by(spacing as usize) {
+        let (color, alpha) = if y % major == 0 {
+            ((90, 150, 240), 0.55)
+        } else {
+            ((110, 140, 190), 0.25)
+        };
+        draw_line(frame, 0, y, frame.width, y, color, alpha);
+    }
+}
+
+fn draw_line(
+    frame: &mut Frame,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    color: (u8, u8, u8),
+    alpha: f32,
+) {
+    if y0 == y1 {
+        for x in x0..x1 {
+            blend(frame, x, y0, color, alpha);
+        }
+    } else if x0 == x1 {
+        for y in y0..y1 {
+            blend(frame, x0, y, color, alpha);
+        }
+    }
+}
+
+fn blend(frame: &mut Frame, x: u32, y: u32, color: (u8, u8, u8), alpha: f32) {
+    if x >= frame.width || y >= frame.height {
+        return;
+    }
+    let offset = ((y * frame.width + x) * 4) as usize;
+    let src = [color.0, color.1, color.2];
+    for (channel, source) in src.iter().enumerate() {
+        let dst = frame.rgba[offset + channel] as f32;
+        frame.rgba[offset + channel] = (*source as f32 * alpha + dst * (1.0 - alpha)).round() as u8;
+    }
+}
+
 pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     {
@@ -272,5 +507,46 @@ pub fn session_marker(conn: &RustConnection, screen_num: usize) -> Option<String
         None
     } else {
         Some(String::from_utf8_lossy(&len.value).into_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame() -> Frame {
+        let mut rgba = Vec::new();
+        for y in 0..4u8 {
+            for x in 0..4u8 {
+                rgba.extend_from_slice(&[x * 16, y * 16, 7, 255]);
+            }
+        }
+        Frame {
+            width: 4,
+            height: 4,
+            rgba,
+        }
+    }
+
+    #[test]
+    fn crop_extracts_rows_and_columns() {
+        let cropped = crop(&frame(), 1, 1, 2, 2).unwrap();
+        assert_eq!((cropped.width, cropped.height), (2, 2));
+        assert_eq!(&cropped.rgba[0..4], &[16, 16, 7, 255]);
+        assert_eq!(&cropped.rgba[4..8], &[32, 16, 7, 255]);
+    }
+
+    #[test]
+    fn crop_clamps_to_frame() {
+        let cropped = crop(&frame(), 3, 3, 100, 100).unwrap();
+        assert_eq!((cropped.width, cropped.height), (1, 1));
+    }
+
+    #[test]
+    fn hash_changes_with_pixels() {
+        let mut other = frame();
+        let before = hash(&other);
+        other.rgba[0] ^= 0xff;
+        assert_ne!(before, hash(&other));
     }
 }

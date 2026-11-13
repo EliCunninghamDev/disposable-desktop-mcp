@@ -47,10 +47,18 @@ def parse(argv):
     while index < len(argv):
         key = argv[index]
         if key.startswith("--"):
+            if "=" in key:
+                name, value = key[2:].split("=", 1)
+                options[name.replace("-", "_")] = value
+                index += 1
+                continue
             name = key[2:].replace("-", "_")
-            value = argv[index + 1] if index + 1 < len(argv) else ""
-            options[name] = value
-            index += 2
+            if index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+                options[name] = argv[index + 1]
+                index += 2
+            else:
+                options[name] = "true"
+                index += 1
         else:
             index += 1
     return options
@@ -262,6 +270,89 @@ def absolutize(nodes):
             node["y"] += offset[1]
 
 
+def resolve_target(desktop, record):
+    """Re-find a live accessible object from a record's path."""
+    app_index_text, *rest = record["path"].split(".")
+    app = safe(lambda: desktop.get_child_at_index(int(app_index_text)))
+    if app is None:
+        return None
+    target = app
+    for part in rest:
+        target = safe(lambda i=int(part): target.get_child_at_index(i))
+        if target is None:
+            break
+    return target
+
+
+def collect_matches(desktop, options, wanted, role_filter, exact=False):
+    """Score accessible nodes by name/role and return (matches, app_count)."""
+    wanted_lower = (wanted or "").strip().lower()
+    chosen = []
+
+    def visit(record):
+        if record["role"].lower() in ("application", "frame") and not record["name"]:
+            return
+        name_lower = record["name"].lower()
+        if wanted_lower:
+            if exact:
+                if name_lower != wanted_lower:
+                    return
+            elif name_lower != wanted_lower and wanted_lower not in name_lower:
+                return
+        elif not role_filter:
+            return
+        if role_filter:
+            if not role_matches(record["role"], role_filter):
+                return
+        clickish = any(
+            any(word in action.lower() for word in ("click", "press", "activate", "toggle"))
+            for action in record["actions"]
+        )
+        role_lower = record["role"].lower()
+        score = 0
+        if wanted_lower and name_lower == wanted_lower:
+            score += 120
+        if clickish:
+            score += 90
+        if role_lower in ACTIONABLE_ROLES:
+            score += 60
+        if role_lower in ("label", "static text", "text"):
+            score -= 40
+        if record["actions"]:
+            score += 10
+        if record["enabled"]:
+            score += 8
+        if record["showing"] or record["visible"]:
+            score += 4
+        if record["width"] and record["height"]:
+            score += 6
+        score += record["depth"]
+        chosen.append((score, record))
+
+    nodes, app_count = walk(desktop, options, visit)
+    absolutize(nodes)
+    chosen.sort(key=lambda item: item[0], reverse=True)
+    return chosen, app_count
+
+ROLE_ALIASES = {
+    "entry": ("text", "password text", "text field"),
+    "textbox": ("text", "password text", "text field"),
+    "text field": ("text", "password text"),
+    "checkbox": ("check box",),
+    "radio": ("radio button",),
+}
+
+
+def role_matches(role, wanted):
+    role = (role or "").lower()
+    wanted = (wanted or "").lower()
+    if not wanted:
+        return True
+    if wanted in role or role in wanted:
+        return True
+    return any(alias in role for alias in ROLE_ALIASES.get(wanted, ()))
+
+
 ACTIONABLE_ROLES = {
     "button", "push button", "toggle button", "menu item", "check box",
     "radio button", "tab", "link", "combo box", "entry", "text", "spin button",
@@ -301,8 +392,7 @@ def main():
             if name_lower != wanted_lower and wanted_lower not in name_lower:
                 return
             if role_filter:
-                role = record["role"].lower()
-                if role_filter not in role and role not in role_filter:
+                if not role_matches(record["role"], role_filter):
                     return
             clickish = any(
                 any(word in action.lower() for word in ("click", "press", "activate", "toggle"))
@@ -388,6 +478,96 @@ def main():
             "action_count": action_count,
             "node": record,
             "candidates": [item[1]["path"] for item in chosen[:8]],
+        })
+
+    if command == "find":
+        wanted = (options.get("name") or "").strip()
+        role_filter = (options.get("role") or "").strip().lower()
+        if not wanted and not role_filter:
+            fail("find needs --name or --role")
+        exact = (options.get("exact") or "").lower() in ("1", "true", "yes")
+        chosen, app_count = collect_matches(desktop, options, wanted, role_filter, exact)
+        limit = max(1, min(int(options.get("limit", 20) or 20), 100))
+        nodes = [record for _, record in chosen[:limit]]
+        emit({
+            "ok": True,
+            "found": bool(chosen),
+            "query": wanted,
+            "role": role_filter or None,
+            "apps": app_count,
+            "count": len(chosen),
+            "nodes": nodes,
+        })
+
+    if command == "set_text":
+        wanted = (options.get("name") or "").strip()
+        role_filter = (options.get("role") or "").strip().lower()
+        if not wanted:
+            fail("set_text needs --name")
+        chosen, app_count = collect_matches(desktop, options, wanted, role_filter)
+        if not chosen:
+            emit({
+                "ok": True,
+                "found": False,
+                "changed": False,
+                "query": wanted,
+                "apps": app_count,
+                "error": f"no accessible named {wanted!r}",
+            })
+        index = int(options.get("index", 0) or 0)
+        index = max(0, min(index, len(chosen) - 1))
+        record = chosen[index][1]
+        target = resolve_target(desktop, record)
+        value = options.get("text", "")
+        editable = bool(safe(lambda: target.is_editable_text(), False)) if target else False
+        focused = bool(record.get("focused"))
+        if not focused and target is not None:
+            focused = bool(safe(lambda: target.grab_focus(), False))
+        changed = bool(safe(lambda: target.set_text_contents(value), False)) if target else False
+        emit({
+            "ok": True,
+            "found": True,
+            "changed": changed,
+            "editable": editable,
+            "focused": focused,
+            "text": value,
+            "node": record,
+        })
+
+    if command == "focus":
+        wanted = (options.get("name") or "").strip()
+        role_filter = (options.get("role") or "").strip().lower()
+        if not wanted and not role_filter:
+            fail("focus needs --name or --role")
+        chosen, app_count = collect_matches(desktop, options, wanted, role_filter)
+        if not chosen:
+            emit({
+                "ok": True,
+                "found": False,
+                "focused": False,
+                "query": wanted,
+                "apps": app_count,
+                "error": f"no accessible named {wanted!r}",
+            })
+        index = int(options.get("index", 0) or 0)
+        index = max(0, min(index, len(chosen) - 1))
+        record = chosen[index][1]
+        target = resolve_target(desktop, record)
+        focused = bool(record.get("focused"))
+        if not focused and target is not None:
+            focused = bool(safe(lambda: target.grab_focus(), False))
+        if not focused and target is not None:
+            count = safe(lambda: int(target.get_n_actions()), 0) or 0
+            for action_index in range(count):
+                name = text(safe(lambda i=action_index: target.get_action_name(i), ""))
+                if "focus" in name.lower():
+                    focused = bool(safe(lambda i=action_index: target.do_action(i), False))
+                    break
+        emit({
+            "ok": True,
+            "found": True,
+            "focused": focused,
+            "node": record,
         })
 
     fail(f"unknown command: {command}")

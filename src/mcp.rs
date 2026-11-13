@@ -1,30 +1,31 @@
-//! Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0).
+//! MCP server built on the official `rmcp` SDK.
 //!
-//! Implements the surface this server needs: initialize, tools/list,
-//! tools/call, ping and notification handling.  All diagnostics go to stderr;
-//! stdout is reserved for protocol messages.
+//! The transport, handshake, JSON-RPC framing, cancellation, and protocol
+//! version negotiation are handled by `rmcp`.  Tool definitions and dispatch
+//! still live in [`crate::tools`]; this module only adapts between the JSON
+//! values used there and rmcp's typed model.
 
 use crate::tools;
 use crate::DisplayManager;
 use anyhow::Result;
+use rmcp::{
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    },
+    service::{RequestContext, RoleServer},
+    transport::stdio,
+    ErrorData as McpError, ServerHandler,
+};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+/// Agent-facing guidance returned in the MCP `initialize` response.
+pub const INSTRUCTIONS: &str = "Use xephyr-mcp for GUI and desktop testing on a private, disposable X desktop: screenshots, mouse/keyboard input, window management, and accessibility-driven UI automation. Nothing here touches the host desktop, host cursor, or host session bus.\n\nTypical flow: display_start -> launch -> screenshot/list_windows -> click/type/key -> display_stop. Call display_start first; if a tool says no display is running, start one. Use visible=false for headless Xvfb or visible=true for a watchable Xephyr window. Screenshots may be downscaled: use the returned scale to convert image coordinates back to display pixels for input. Prefer a11y_find/a11y_click over pixels for forms, buttons, and menus.\n\nAfter an action that changes the UI, call wait_for_idle before the next screenshot or click instead of polling. Use wait_for to block on a window title/class, a process exit, a screen-stable state, a changed region, or a file. Use screenshot region/window_id for legible native-resolution crops, clipboard_set/clipboard_get for long or Unicode text, and list_processes/tail_log when an app fails to start. Call diagnose first when an environmental tool is missing.\n\nEach server process owns one display and can run several sessions via session_id. A host-side viewer can watch them: 'xephyr-mcp-viewer --session ID', or '--layout bsp' to tile every live session. Call display_stop when finished; it reaps every launched process group, the window manager, the X server, and the private D-Bus/AT-SPI buses.";
 
 pub enum Content {
     Text(String),
     Image { data: String, mime_type: String },
-}
-
-impl Content {
-    fn to_json(&self) -> Value {
-        match self {
-            Content::Text(text) => json!({ "type": "text", "text": text }),
-            Content::Image { data, mime_type } => {
-                json!({ "type": "image", "data": data, "mimeType": mime_type })
-            }
-        }
-    }
 }
 
 pub struct CallResult {
@@ -64,107 +65,107 @@ impl CallResult {
 
     pub fn error(message: impl Into<String>) -> Self {
         Self {
-            content: vec![Content::Text(format!("Error: {}", message.into()))],
+            content: vec![Content::Text(message.into())],
             is_error: true,
         }
     }
 
-    pub fn to_json(&self) -> Value {
-        let content: Vec<Value> = self.content.iter().map(Content::to_json).collect();
-        let mut out = json!({ "content": content });
+    /// Convert to rmcp's typed tool result.  Tool-level failures stay in the
+    /// result (`isError`) so the caller sees the message, matching MCP's
+    /// guidance for errors raised while executing a valid tool call.
+    pub fn into_mcp(self) -> CallToolResult {
+        let content: Vec<ContentBlock> = self
+            .content
+            .into_iter()
+            .map(|item| match item {
+                Content::Text(text) => ContentBlock::text(text),
+                Content::Image { data, mime_type } => ContentBlock::image(data, mime_type),
+            })
+            .collect();
         if self.is_error {
-            out["isError"] = Value::Bool(true);
+            CallToolResult::error(content)
+        } else {
+            CallToolResult::success(content)
         }
-        out
     }
+}
+
+#[derive(Clone)]
+pub struct XephyrServer {
+    manager: Arc<DisplayManager>,
+}
+
+impl XephyrServer {
+    pub fn new(manager: Arc<DisplayManager>) -> Self {
+        Self { manager }
+    }
+}
+
+impl ServerHandler for XephyrServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("xephyr-mcp", env!("CARGO_PKG_VERSION")))
+            .with_instructions(INSTRUCTIONS)
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items(
+            tools::definitions()
+                .into_iter()
+                .map(tool_from_json)
+                .collect(),
+        ))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let args = request
+            .arguments
+            .map(Value::Object)
+            .unwrap_or_else(|| json!({}));
+        Ok(tools::call(&self.manager, &request.name, &args)
+            .await
+            .into_mcp()
+            .into())
+    }
+}
+
+/// Adapt the JSON tool definitions in `tools.rs` to rmcp's typed `Tool`.
+fn tool_from_json(value: Value) -> Tool {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let schema = value
+        .get("inputSchema")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    Tool::new(name, description, Arc::new(schema))
 }
 
 pub async fn serve(manager: Arc<DisplayManager>) -> Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut out = tokio::io::stdout();
-
     eprintln!("[xephyr-mcp] server ready (v{})", env!("CARGO_PKG_VERSION"));
-
-    while let Some(line) = lines.next_line().await? {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let msg: Value = match serde_json::from_str(line) {
-            Ok(msg) => msg,
-            Err(err) => {
-                eprintln!("[xephyr-mcp] malformed JSON: {err}");
-                continue;
-            }
-        };
-        if let Some(response) = handle(&manager, &msg).await {
-            let mut encoded = serde_json::to_string(&response)?;
-            encoded.push('\n');
-            out.write_all(encoded.as_bytes()).await?;
-            out.flush().await?;
-        }
-    }
-
+    let running = rmcp::serve_server(XephyrServer::new(manager), stdio())
+        .await
+        .map_err(|err| anyhow::anyhow!("MCP initialization failed: {err}"))?;
+    running
+        .waiting()
+        .await
+        .map_err(|err| anyhow::anyhow!("MCP server task failed: {err}"))?;
     eprintln!("[xephyr-mcp] stdin closed, shutting down");
     Ok(())
-}
-
-async fn handle(manager: &DisplayManager, msg: &Value) -> Option<Value> {
-    let id = msg.get("id").cloned();
-    let method = msg.get("method").and_then(Value::as_str)?;
-
-    // Notifications never get a response.
-    id.as_ref()?;
-
-    let outcome: Result<Value, (i64, String)> = match method {
-        "initialize" => Ok(initialize(msg)),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tools::definitions() })),
-        "tools/call" => call_tool(manager, msg).await,
-        "shutdown" => Ok(json!({})),
-        "logging/setLevel" => Ok(json!({})),
-        other => Err((-32601, format!("method not found: {other}"))),
-    };
-
-    let id = id?;
-    Some(match outcome {
-        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err((code, message)) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": { "code": code, "message": message }
-        }),
-    })
-}
-
-async fn call_tool(manager: &DisplayManager, msg: &Value) -> Result<Value, (i64, String)> {
-    let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
-    let name = params
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or((-32602, "tools/call requires a tool name".to_string()))?;
-    let args = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let args = if args.is_object() { args } else { json!({}) };
-    Ok(tools::call(manager, name, &args).await.to_json())
-}
-
-fn initialize(msg: &Value) -> Value {
-    let requested = msg
-        .get("params")
-        .and_then(|p| p.get("protocolVersion"))
-        .and_then(Value::as_str)
-        .unwrap_or("2025-06-18");
-
-    json!({
-        "protocolVersion": requested,
-        "capabilities": { "tools": {} },
-        "serverInfo": {
-            "name": "xephyr-mcp",
-            "version": env!("CARGO_PKG_VERSION")
-        },
-        "instructions": "Use xephyr-mcp for GUI and desktop testing on a private, disposable X desktop: screenshots, mouse/keyboard input, window management, and accessibility-driven UI automation. Nothing here touches the host desktop, host cursor, or host session bus.\n\nTypical flow: display_start -> launch -> screenshot/list_windows -> click/type/key -> display_stop. Call display_start first; if a tool says no display is running, start one. Use visible=false for headless Xvfb or visible=true for a watchable Xephyr window. Screenshots may be downscaled: use the returned scale to convert image coordinates back to display pixels for input. Prefer a11y_tree/a11y_click over pixels for forms, buttons, and menus.\n\nEach server process owns one display and can run several sessions via session_id. A host-side viewer can watch them: 'xephyr-mcp-viewer --session ID', or '--layout bsp' to tile every live session. Call display_stop when finished; it reaps every launched process group, the window manager, the X server, and the private D-Bus/AT-SPI buses."
-    })
 }
