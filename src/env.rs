@@ -36,7 +36,7 @@ pub fn runtime_root() -> Option<PathBuf> {
         .any(|rel| is_executable(&p.join(rel)))
     };
 
-    if let Some(value) = env::var_os("XEPHYR_MCP_RUNTIME") {
+    if let Some(value) = env::var_os("DISPOSABLE_DESKTOP_MCP_RUNTIME") {
         let path = PathBuf::from(value);
         if looks_right(&path) {
             return Some(path);
@@ -64,8 +64,8 @@ pub fn runtime_root() -> Option<PathBuf> {
 
     if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
         for candidate in [
-            home.join(".local/opt/xephyr-mcp"),
-            home.join(".local/share/xephyr-mcp"),
+            home.join(".local/opt/disposable-desktop-mcp"),
+            home.join(".local/share/disposable-desktop-mcp"),
         ] {
             if looks_right(&candidate) {
                 return Some(candidate);
@@ -218,10 +218,10 @@ pub fn host_xauthority() -> Option<OsString> {
 /// Falls back to a per-uid temp directory when XDG_RUNTIME_DIR is unset.
 pub fn shared_runtime_dir() -> PathBuf {
     if let Some(dir) = env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
-        return PathBuf::from(dir).join("xephyr-mcp");
+        return PathBuf::from(dir).join("disposable-desktop-mcp");
     }
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/xephyr-mcp-{uid}"))
+    PathBuf::from(format!("/tmp/disposable-desktop-mcp-{uid}"))
 }
 
 pub fn state_file() -> PathBuf {

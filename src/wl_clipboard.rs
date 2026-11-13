@@ -548,7 +548,7 @@ pub fn set(runtime_dir: &Path, display: &str, text: &str) -> Result<usize> {
     let thread_socket = socket.clone();
     let thread_text = text.to_string();
     std::thread::Builder::new()
-        .name("xephyr-mcp-clipboard".into())
+        .name("disposable-desktop-mcp-clipboard".into())
         .spawn(move || {
             let _ = serve(&thread_socket, &thread_text, stop_read, ready_tx);
         })

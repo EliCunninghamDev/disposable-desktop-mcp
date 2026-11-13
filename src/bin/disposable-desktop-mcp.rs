@@ -1,13 +1,13 @@
 use anyhow::Result;
+use disposable_desktop_mcp::{mcp, DisplayManager};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
-use xephyr_mcp::{mcp, DisplayManager};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let manager = Arc::new(DisplayManager::new());
     eprintln!(
-        "[xephyr-mcp] tools: {}",
+        "[disposable-desktop-mcp] tools: {}",
         serde_json::to_string(&manager.tools.describe()).unwrap_or_default()
     );
 
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
 
     let result = mcp::serve(manager.clone()).await;
     if let Err(err) = manager.stop().await {
-        eprintln!("[xephyr-mcp] cleanup failed: {err:#}");
+        eprintln!("[disposable-desktop-mcp] cleanup failed: {err:#}");
     }
     result
 }

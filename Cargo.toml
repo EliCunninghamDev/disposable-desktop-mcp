@@ -1,5 +1,5 @@
 [package]
-name = "xephyr-mcp"
+name = "disposable-desktop-mcp"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"

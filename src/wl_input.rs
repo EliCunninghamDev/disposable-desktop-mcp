@@ -320,7 +320,7 @@ impl WaylandInput {
         if !bytes.ends_with(&[0]) {
             bytes.push(0);
         }
-        let name = c"xephyr-mcp-keymap";
+        let name = c"disposable-desktop-mcp-keymap";
         let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).context("memfd_create failed");

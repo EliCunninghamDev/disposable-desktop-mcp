@@ -1,10 +1,10 @@
-//! MCP server and live viewer for a nested Xephyr/Xvfb desktop.
+//! MCP server and live viewer for a private X11 or Wayland desktop.
 //!
-//! The server owns one nested X display at a time.  Everything it launches
-//! lives in that display: the X server, a window manager, a private D-Bus
-//! session bus, an accessibility bus, and the applications the agent starts.
-//! The host session is never used for any of the input, capture, or window
-//! management paths.
+//! The server owns one nested desktop at a time.  Everything it launches
+//! lives inside it: an X server or a sway compositor, a window manager, a
+//! private D-Bus session bus, an accessibility bus, and the applications the
+//! agent starts.  The host session is never used for any of the input, capture,
+//! or window management paths.
 
 pub mod a11y;
 pub mod backend;

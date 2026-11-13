@@ -17,7 +17,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$REPO/.runtime"
-MIRROR="${XEPHYR_MCP_MIRROR:-https://geo.mirror.pkgbuild.com}"
+MIRROR="${DISPOSABLE_DESKTOP_MCP_MIRROR:-https://geo.mirror.pkgbuild.com}"
 
 PACKAGES=(
   xorg-server-xephyr
@@ -30,7 +30,7 @@ PACKAGES=(
 # Only needed by the Wayland backend and its smoke test.  wlroots is packaged
 # under a versioned name; override if Arch moves to a newer ABI.
 WAYLAND=false
-WLROOTS_PKG="${XEPHYR_MCP_WLROOTS_PKG:-wlroots0.20}"
+WLROOTS_PKG="${DISPOSABLE_DESKTOP_MCP_WLROOTS_PKG:-wlroots0.20}"
 WAYLAND_PACKAGES=(
   sway
   "$WLROOTS_PKG"
@@ -121,6 +121,6 @@ if $WAYLAND; then
 fi
 
 echo
-echo "Runtime ready.  xephyr-mcp finds it automatically; add"
+echo "Runtime ready.  disposable-desktop-mcp finds it automatically; add"
 echo "  export PATH=\"$DEST/bin:\$PATH\""
 echo "to your shell if you want the binaries on PATH yourself."

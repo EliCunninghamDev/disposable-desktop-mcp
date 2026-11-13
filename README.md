@@ -1,4 +1,4 @@
-# xephyr-mcp
+# disposable-desktop-mcp
 
 An MCP server that gives an agent its own private desktop, plus a live GTK4
 viewer for watching it. X11 (the default) uses a nested Xephyr (visible) or Xvfb
@@ -10,7 +10,7 @@ never used.
 
 ```
 ┌──────────────┐   stdio JSON-RPC   ┌──────────────────────────────────────────────┐
-│ MCP client   │ ─────────────────► │ xephyr-mcp                                   │
+│ MCP client   │ ─────────────────► │ disposable-desktop-mcp                       │
 │ (OpenCode)   │                    │  X11:     Xephyr / Xvfb  :100                │
 └──────────────┘                    │           openbox · GetImage · XTEST         │
                                     │  Wayland: sway (headless / nested)           │
@@ -19,7 +19,7 @@ never used.
                                     └──────────────┬───────────────────────────────┘
                                                    │ frames + forwarded input
                                     ┌──────────────▼───────────────────────────────┐
-                                    │ xephyr-mcp-viewer (GTK4)                     │
+                                    │ disposable-desktop-viewer (GTK4)             │
                                     │  dropdown · Single · BSP                     │
                                     └──────────────────────────────────────────────┘
 ```
@@ -60,11 +60,11 @@ never used.
   HOME, an auto-teardown watchdog, and explicit agent/human input arbitration
   with `wait_for_control`.
 - **Trace and marks.** Every tool call is appended to
-`$XDG_RUNTIME_DIR/xephyr-mcp/traces/<session_id>.jsonl` with the sanitized
+`$XDG_RUNTIME_DIR/disposable-desktop-mcp/traces/<session_id>.jsonl` with the sanitized
 arguments, duration, outcome, and before/after frame hashes for screen-changing
 tools. Traces survive `display_stop`; read them with `trace_tail`.
 
-Set `XEPHYR_MCP_TRACE_SCREENSHOTS=1` to also save the before/after frame of each
+Set `DISPOSABLE_DESKTOP_MCP_TRACE_SCREENSHOTS=1` to also save the before/after frame of each
 screen-changing call under `traces/steps/<session>/`. The trace entry then
 carries `before_shot` and `after_shot` paths; the newest 400 images per session
 are kept.
@@ -105,9 +105,9 @@ reaper stores its exit status, so `launch_status` can report `running`,
 `exit_code`, the terminating signal, and uptime long after launch returned.
 
 `persist_home=true` on `display_start` keeps `HOME` and XDG directories under
-`$XDG_RUNTIME_DIR/xephyr-mcp/homes/<session_id>` across restarts with the same
-session id. Set `XEPHYR_MCP_IDLE_TIMEOUT_SECS` or
-`XEPHYR_MCP_MAX_LIFETIME_SECS` to enable the watchdog, which tears down a
+`$XDG_RUNTIME_DIR/disposable-desktop-mcp/homes/<session_id>` across restarts with the same
+session id. Set `DISPOSABLE_DESKTOP_MCP_IDLE_TIMEOUT_SECS` or
+`DISPOSABLE_DESKTOP_MCP_MAX_LIFETIME_SECS` to enable the watchdog, which tears down a
 desktop when no tool call is active and the limit has elapsed.
 
 The clipboard tools own the selection directly: on X11 a background thread
@@ -178,16 +178,16 @@ everything down. It never connects to the host compositor.
 
 ```sh
 # Follow the current/default session
-xephyr-mcp-viewer
+disposable-desktop-viewer
 
 # Follow a specific session
-xephyr-mcp-viewer --session alpha
+disposable-desktop-viewer --session alpha
 
 # List discoverable sessions and exit
-xephyr-mcp-viewer --list
+disposable-desktop-viewer --list
 
 # Open directly in BSP tiling mode
-xephyr-mcp-viewer --layout bsp
+disposable-desktop-viewer --layout bsp
 ```
 
 The toolbar contains:
@@ -226,18 +226,18 @@ Useful options: `--host-display :N`, `--fps N`, `--scale N`,
 
 ### Desktop shortcut
 
-`packaging/xephyr-mcp-viewer.desktop` adds the viewer to KRunner, the Plasma
+`packaging/disposable-desktop-viewer.desktop` adds the viewer to KRunner, the Plasma
 application menu, and other desktop launchers. It also provides an
 "Open in BSP tiling mode" action.
 
 ```sh
-install -Dm644 packaging/xephyr-mcp-viewer.desktop \
-  ~/.local/share/applications/xephyr-mcp-viewer.desktop
+install -Dm644 packaging/disposable-desktop-viewer.desktop \
+  ~/.local/share/applications/disposable-desktop-viewer.desktop
 update-desktop-database ~/.local/share/applications
 kbuildsycoca6        # Plasma 6 (kbuildsycoca5 on Plasma 5)
 ```
 
-The packaged entry uses `Exec=xephyr-mcp-viewer`, so `~/.cargo/bin` (or wherever
+The packaged entry uses `Exec=disposable-desktop-viewer`, so `~/.cargo/bin` (or wherever
 `cargo install` placed it) must be on the desktop session's `PATH`. If it is
 not, replace the `Exec=` and `TryExec=` lines with the absolute binary path.
 
@@ -250,7 +250,7 @@ not, replace the `Exec=` and `TryExec=` lines with the absolute binary path.
 - `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` point at the private compositor for
   `backend="wayland"`; host `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`, and the
   host runtime directory are removed or replaced;
-- `XDG_RUNTIME_DIR` is a fresh directory under `/run/user/<uid>/xephyr-mcp/`;
+- `XDG_RUNTIME_DIR` is a fresh directory under `/run/user/<uid>/disposable-desktop-mcp/`;
 - a private `dbus-daemon --session` and an AT-SPI bus are started;
 - Xephyr/Xvfb and openbox, or sway, plus the bus daemons and launched
   applications, are placed in their own process groups.
@@ -259,7 +259,7 @@ not, replace the `Exec=` and `TryExec=` lines with the absolute binary path.
 server dies unexpectedly, the next start finds the stale state file, inspects
 `/proc/<pid>/environ` to confirm ownership, and reaps the old runtime.
 
-State lives in `$XDG_RUNTIME_DIR/xephyr-mcp/` (sessions are in `sessions/` and
+State lives in `$XDG_RUNTIME_DIR/disposable-desktop-mcp/` (sessions are in `sessions/` and
 the current session in `current.json`). Session directories are removed when
 their display stops.
 

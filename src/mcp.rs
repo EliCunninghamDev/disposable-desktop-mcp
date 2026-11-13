@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 /// Agent-facing guidance returned in the MCP `initialize` response.
-pub const INSTRUCTIONS: &str = "Use xephyr-mcp for GUI and desktop testing on a private, disposable desktop: screenshots, mouse/keyboard input, window management, and accessibility-driven UI automation. The default backend is X11 (Xephyr or Xvfb); backend=wayland uses sway, headless or nested. Nothing here touches the host desktop, host cursor, host clipboard, or host session bus.\n\nTypical flow: display_start -> launch -> screenshot/list_windows -> click/type/key -> display_stop. Call display_start first; if a tool says no display is running, start one. Use visible=false for a headless compositor or visible=true for a watchable nested window. Screenshots may be downscaled: use the returned scale to convert image coordinates back to display pixels for input. Prefer a11y_find/a11y_click over pixels for forms, buttons, and menus.\n\nAfter an action that changes the UI, call wait_for_idle before the next screenshot or click instead of polling. Use wait_for to block on a window title/class, a process exit, a screen-stable state, a changed region, or a file. Use screenshot region/window_id for legible native-resolution crops, clipboard_set/clipboard_get for long or Unicode text, and list_processes/tail_log when an app fails to start. Call diagnose first when an environmental tool is missing. For repeated clicks use count; hold ctrl/shift/alt with modifiers; use mouse_down/mouse_up and key_down/key_up for state that spans calls. window_state changes minimize/maximize/fullscreen/always-on-top; resize_display works on both X11 and Wayland sessions. screenshot marks=true numbers actionable elements and click(mark=N) activates them through accessibility when possible. Every call is traced; use trace_tail to review what happened, and launch_status to check whether a launched process is still running or has an exit code. While a viewer has human control, pointer/keyboard/accessibility tools are refused; call wait_for_control(owner=\"agent\") to block until it is released. Process lifetime: launch starts a detached process group that keeps running after the call returns and after its window closes; a finished screenshot or a disappeared window does not mean the process exited. Before finishing a task, call kill_process with all=true (or display_stop, which reaps apps, window manager, X server, and buses). If an app is meant to stay alive, say so explicitly. display_start persist_home=true keeps app profiles, and XEPHYR_MCP_IDLE_TIMEOUT_SECS enables auto-teardown.\n\nEach server process owns one display and can run several sessions via session_id. A host-side viewer can watch them: 'xephyr-mcp-viewer --session ID', or '--layout bsp' to tile every live session. Call display_stop when finished; it reaps every launched process group, the window manager, the X server, and the private D-Bus/AT-SPI buses.";
+pub const INSTRUCTIONS: &str = "Use disposable-desktop-mcp for GUI and desktop testing on a private, disposable desktop: screenshots, mouse/keyboard input, window management, and accessibility-driven UI automation. The default backend is X11 (Xephyr or Xvfb); backend=wayland uses sway, headless or nested. Nothing here touches the host desktop, host cursor, host clipboard, or host session bus.\n\nTypical flow: display_start -> launch -> screenshot/list_windows -> click/type/key -> display_stop. Call display_start first; if a tool says no display is running, start one. Use visible=false for a headless compositor or visible=true for a watchable nested window. Screenshots may be downscaled: use the returned scale to convert image coordinates back to display pixels for input. Prefer a11y_find/a11y_click over pixels for forms, buttons, and menus.\n\nAfter an action that changes the UI, call wait_for_idle before the next screenshot or click instead of polling. Use wait_for to block on a window title/class, a process exit, a screen-stable state, a changed region, or a file. Use screenshot region/window_id for legible native-resolution crops, clipboard_set/clipboard_get for long or Unicode text, and list_processes/tail_log when an app fails to start. Call diagnose first when an environmental tool is missing. For repeated clicks use count; hold ctrl/shift/alt with modifiers; use mouse_down/mouse_up and key_down/key_up for state that spans calls. window_state changes minimize/maximize/fullscreen/always-on-top; resize_display works on both X11 and Wayland sessions. screenshot marks=true numbers actionable elements and click(mark=N) activates them through accessibility when possible. Every call is traced; use trace_tail to review what happened, and launch_status to check whether a launched process is still running or has an exit code. While a viewer has human control, pointer/keyboard/accessibility tools are refused; call wait_for_control(owner=\"agent\") to block until it is released. Process lifetime: launch starts a detached process group that keeps running after the call returns and after its window closes; a finished screenshot or a disappeared window does not mean the process exited. Before finishing a task, call kill_process with all=true (or display_stop, which reaps apps, window manager, X server, and buses). If an app is meant to stay alive, say so explicitly. display_start persist_home=true keeps app profiles, and DISPOSABLE_DESKTOP_MCP_IDLE_TIMEOUT_SECS enables auto-teardown.\n\nEach server process owns one display and can run several sessions via session_id. A host-side viewer can watch them: 'disposable-desktop-viewer --session ID', or '--layout bsp' to tile every live session. Call display_stop when finished; it reaps every launched process group, the window manager, the X server, and the private D-Bus/AT-SPI buses.";
 
 pub enum Content {
     Text(String),
@@ -99,20 +99,23 @@ impl CallResult {
 }
 
 #[derive(Clone)]
-pub struct XephyrServer {
+pub struct DesktopServer {
     manager: Arc<DisplayManager>,
 }
 
-impl XephyrServer {
+impl DesktopServer {
     pub fn new(manager: Arc<DisplayManager>) -> Self {
         Self { manager }
     }
 }
 
-impl ServerHandler for XephyrServer {
+impl ServerHandler for DesktopServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("xephyr-mcp", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                "disposable-desktop-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions(INSTRUCTIONS)
     }
 
@@ -166,15 +169,18 @@ fn tool_from_json(value: Value) -> Tool {
 }
 
 pub async fn serve(manager: Arc<DisplayManager>) -> Result<()> {
-    eprintln!("[xephyr-mcp] server ready (v{})", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "[disposable-desktop-mcp] server ready (v{})",
+        env!("CARGO_PKG_VERSION")
+    );
     let watchdog = tokio::spawn(watchdog(manager.clone()));
-    let running = rmcp::serve_server(XephyrServer::new(manager), stdio())
+    let running = rmcp::serve_server(DesktopServer::new(manager), stdio())
         .await
         .map_err(|err| anyhow::anyhow!("MCP initialization failed: {err}"))?;
     let outcome = running.waiting().await;
     watchdog.abort();
     outcome.map_err(|err| anyhow::anyhow!("MCP server task failed: {err}"))?;
-    eprintln!("[xephyr-mcp] stdin closed, shutting down");
+    eprintln!("[disposable-desktop-mcp] stdin closed, shutting down");
     Ok(())
 }
 
@@ -195,7 +201,7 @@ async fn watchdog(manager: Arc<DisplayManager>) {
         );
         if let Some(reason) = manager.should_auto_stop(running_for) {
             eprintln!(
-                "[xephyr-mcp] watchdog: stopping {} ({reason})",
+                "[disposable-desktop-mcp] watchdog: stopping {} ({reason})",
                 session.info.display
             );
             let path = crate::trace::path_for(Some(&session.info.session_id));
@@ -212,7 +218,7 @@ async fn watchdog(manager: Arc<DisplayManager>) {
             );
             let _ = crate::trace::append(&path, entry);
             if let Err(err) = manager.stop().await {
-                eprintln!("[xephyr-mcp] watchdog stop failed: {err:#}");
+                eprintln!("[disposable-desktop-mcp] watchdog stop failed: {err:#}");
             }
         }
     }
