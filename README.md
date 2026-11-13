@@ -1,9 +1,10 @@
 # disposable-desktop-mcp
 
 An MCP server that gives an agent its own private desktop, plus a live GTK4
-viewer for watching it. X11 (the default) uses a nested Xephyr (visible) or Xvfb
-(headless) display with openbox; Wayland uses sway, headless or nested on the
-host compositor. The backend is chosen per session, and both are driven through
+viewer for watching it. X11 (the default) uses Xvfb (headless) or a nested
+Xephyr window; Wayland uses sway, headless or nested on the host compositor.
+`display_start` is headless by default: `visible=true` is opt-in for a window a
+person can watch. The backend is chosen per session, and both are driven through
 the same tool surface. Both get a private D-Bus session bus, accessibility bus,
 and runtime directory. Host input, host windows, and the host session bus are
 never used.
@@ -124,10 +125,11 @@ agents: it sends `SIGTERM` to every launched process group, waits briefly, then
 
 ## Wayland backend
 
-`backend="wayland"` starts sway in the private runtime directory. `visible=false`
-is a headless compositor (the Xvfb analog); `visible=true` opens a nested window
-on the host Wayland session, or on the host X11 session via `WLR_BACKENDS=x11`
-(the Xephyr analog). X11 remains the default.
+`backend="wayland"` starts sway in the private runtime directory. Headless is
+the default (`visible=false`), which is the Xvfb analog. `visible=true` opens a
+nested window on the host Wayland session, or on the host X11 session via
+`WLR_BACKENDS=x11` (the Xephyr analog), if a person needs to watch. X11 remains
+the default backend.
 
 Implemented on this backend:
 
@@ -210,6 +212,11 @@ session, so press `Ctrl+Shift+C` to release and get the shortcuts above back.
 `Ctrl+Shift+Q` closes the viewer while human control is active. Claims are tied
 to the viewer PID, so a crashed viewer cannot lock an agent out.
 
+The viewer attaches to any running session, headless or visible, so a headless
+desktop can be shown on demand without restarting it. Starting with
+`visible=true` is only needed when the nested server window itself should exist
+on the host from the start.
+
 Wayland sessions (including headless ones) are captured through the output
 screencopy path and receive forwarded input through the virtual pointer and
 keyboard. A nested Wayland session parks its host input devices on a dummy seat
@@ -280,10 +287,10 @@ tools return a clear error and the rest of the server keeps working.
 - Linux only. The X11 backend needs Xephyr or Xvfb; the Wayland backend needs
   sway and the wlroots protocols listed above. The viewer still needs a host
   X11/XWayland display.
-- The viewer forwards input only after explicit human control; X11 host input
-  still reaches a visible Xephyr window directly, so use `visible=false` when
-  that matters. A nested Wayland session can park its host devices on a
-  `locked` seat instead.
+- The viewer forwards input only after explicit human control. Headless is the
+  default, but if a session is started with `visible=true`, host input can reach
+  a visible Xephyr window directly. A nested Wayland session can park its host
+  devices on a `locked` seat instead.
 - Wayland windows are moved/resized only while floating; tiled windows return an
   error. Per-window capture never includes the compositor cursor.
 - `launch` runs arbitrary shell commands inside the nested desktop. Treat the

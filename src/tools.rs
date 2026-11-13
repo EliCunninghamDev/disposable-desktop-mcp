@@ -30,13 +30,13 @@ pub fn definitions() -> Vec<Value> {
     vec![
         tool(
             "display_start",
-            "Start a private, disposable nested desktop for GUI testing, screenshots, mouse/keyboard automation, and window management. Call this before any other disposable-desktop-mcp tool. backend=\"x11\" (default) uses Xephyr (visible=true, a watchable window on the host X11/XWayland display) or headless Xvfb (visible=false). backend=\"wayland\" uses sway: visible=false is a headless compositor (the Xvfb analog) and visible=true opens a nested window on the host Wayland or X11 session (the Xephyr analog). X11 sessions get a window manager and private D-Bus/AT-SPI buses; Wayland sessions get sway, a private runtime dir, and the same private buses. Each server process owns one display: call display_stop before starting another, or run separate server instances with distinct session_id values for parallel desktops. Returns display, backend, capabilities, pids, dbus_address, runtime/log/home dirs, trace path, and accessibility status.",
+            "Start a private, disposable desktop for GUI testing, screenshots, mouse/keyboard automation, and window management. Call this before any other disposable-desktop-mcp tool. Sessions are headless by default (visible=false); pass visible=true only when a person needs a watchable window on the host desktop. backend=\"x11\" (default) uses Xvfb when headless or Xephyr when visible. backend=\"wayland\" uses sway: headless by default, or a nested window on the host Wayland or X11 session when visible=true. X11 sessions get a window manager and private D-Bus/AT-SPI buses; Wayland sessions get sway, a private runtime dir, and the same private buses. Each server process owns one display: call display_stop before starting another, or run separate server instances with distinct session_id values for parallel desktops. Returns display, backend, capabilities, pids, dbus_address, runtime/log/home dirs, trace path, and accessibility status.",
             schema(
                 json!({
                     "width": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Screen width in pixels (default 1280)" },
                     "height": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Screen height in pixels (default 800)" },
                     "backend": { "type": "string", "enum": ["x11", "wayland"], "description": "Display backend (default x11). wayland uses sway and exposes capture, window control, resize, virtual-device pointer/keyboard input, and the data-control clipboard." },
-                    "visible": { "type": "boolean", "description": "Open a window on the host desktop (true, default) or run headless (false)" },
+                    "visible": { "type": "boolean", "description": "Run headless (false, default) or open a window on the host desktop (true); the latter is only for a person to watch or interact with the desktop" },
                     "xwayland": { "type": "boolean", "description": "wayland only: start XWayland so X11-only apps get a DISPLAY (default false; adds a host-global /tmp/.X11-unix socket)" },
                     "session_id": { "type": "string", "description": "Optional caller-supplied identifier (1-64 letters/digits/-_.). Used by the viewer and to keep multiple server instances apart. Generated if omitted." },
                     "persist_home": { "type": "boolean", "description": "Keep HOME and XDG directories under the state dir keyed by session_id, so app profiles survive display_stop/display_start (default false)" }
@@ -789,7 +789,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         "display_start" => {
             let width = opt_u64(args, "width").unwrap_or(1280) as u32;
             let height = opt_u64(args, "height").unwrap_or(800) as u32;
-            let visible = opt_bool(args, "visible").unwrap_or(true);
+            let visible = opt_bool(args, "visible").unwrap_or(false);
             let backend = match opt_str(args, "backend").unwrap_or("x11") {
                 "x11" => BackendKind::X11,
                 "wayland" => BackendKind::Wayland,
