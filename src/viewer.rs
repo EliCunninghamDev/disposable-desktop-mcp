@@ -814,8 +814,12 @@ impl Viewer {
         self.syncing = true;
         self.single_button.set_active(self.layout == Layout::Single);
         self.bsp_button.set_active(self.layout == Layout::Bsp);
-        self.bsp_button
-            .set_label(&format!("BSP {}", self.panes.len().max(1)));
+        let tile_count = self.sessions.len().min(MAX_PANES);
+        self.bsp_button.set_label(&if tile_count == 0 {
+            "BSP".to_string()
+        } else {
+            format!("BSP {tile_count}")
+        });
         if self.sessions.len() > MAX_PANES && self.layout == Layout::Bsp {
             self.bsp_button.set_tooltip_text(Some(&format!(
                 "Showing {} of {} live sessions",
