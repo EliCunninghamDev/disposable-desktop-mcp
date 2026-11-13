@@ -683,6 +683,7 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
 
     {
         let viewer = viewer.clone();
+        canvas.set_focusable(true);
         canvas.set_draw_func(move |_area, context, width, height| {
             if let Ok(mut viewer) = viewer.try_borrow_mut() {
                 viewer.draw(context, width, height);
@@ -751,6 +752,9 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
 
     {
         let key = gtk::EventControllerKey::new();
+        // The viewer must see keys before a focused toolbar widget can consume
+        // Return or a shortcut chord.
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
         let released_viewer = viewer.clone();
         let viewer = viewer.clone();
         key.connect_key_pressed(move |_, keyval, _, modifiers| {
@@ -870,6 +874,9 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
         let released_viewer = viewer.clone();
         let viewer = viewer.clone();
         click.connect_pressed(move |gesture, _, x, y| {
+            if let Some(widget) = gesture.widget() {
+                widget.grab_focus();
+            }
             if let Ok(mut viewer) = viewer.try_borrow_mut() {
                 viewer.last_pointer = Some((x, y));
                 viewer.forward_button(gesture.current_button(), x, y, true);
