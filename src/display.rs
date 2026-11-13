@@ -1,9 +1,11 @@
 //! Owns the nested display: X server, window manager, private D-Bus session,
 //! accessibility bus, launched applications, and shutdown.
 
+use crate::backend::{Backend, BackendKind, Capabilities};
 use crate::env::{self, Tool};
 use crate::proc;
 use crate::state::{self, State};
+use crate::sway;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
@@ -20,6 +22,7 @@ pub struct Tools {
     pub runtime: Option<PathBuf>,
     pub xephyr: Option<Tool>,
     pub xvfb: Option<Tool>,
+    pub sway: Option<Tool>,
     pub wm: Option<Tool>,
     pub xdotool: Option<Tool>,
     pub python: Option<Tool>,
@@ -43,6 +46,7 @@ impl Tools {
         .find_map(|name| env::find_tool(name, rt));
         let xephyr = env::find_tool("Xephyr", rt);
         let xvfb = env::find_tool("Xvfb", rt);
+        let sway = env::find_tool("sway", rt);
         let xdotool = env::find_tool("xdotool", rt);
         let python = env::find_tool("python3", rt);
         let gdbus = env::find_tool("gdbus", rt);
@@ -52,6 +56,7 @@ impl Tools {
             runtime,
             xephyr,
             xvfb,
+            sway,
             wm,
             xdotool,
             python,
@@ -73,6 +78,7 @@ impl Tools {
         json!({
             "xephyr": self.xephyr.as_ref().map(Tool::label),
             "xvfb": self.xvfb.as_ref().map(Tool::label),
+            "sway": self.sway.as_ref().map(Tool::label),
             "window_manager": self.wm.as_ref().map(Tool::label),
             "xdotool": self.xdotool.as_ref().map(Tool::label),
             "python3": self.python.as_ref().map(Tool::label),
@@ -106,9 +112,19 @@ pub struct SessionInfo {
     pub home: Option<PathBuf>,
     pub persistent_home: bool,
     pub started_at: u64,
+    pub backend: BackendKind,
+    pub wayland_display: Option<String>,
+    pub swaysock: Option<PathBuf>,
+    pub output_name: Option<String>,
+    /// XWayland's DISPLAY inside a Wayland session, when enabled.
+    pub xdisplay: Option<String>,
 }
 
 impl SessionInfo {
+    pub fn capabilities(&self) -> Capabilities {
+        Capabilities::for_backend(self.backend)
+    }
+
     pub fn pids(&self) -> Vec<u32> {
         let mut pids = vec![self.xserver_pid, self.dbus_pid, self.dbus_group];
         if let Some(pid) = self.wm_pid {
@@ -122,7 +138,7 @@ impl SessionInfo {
     }
 
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "session_id": self.session_id,
             "display": self.display,
             "display_number": self.number,
@@ -146,11 +162,21 @@ impl SessionInfo {
             "persistent_home": self.persistent_home,
             "trace": crate::trace::session_path(&self.session_id).display().to_string(),
             "state_file": env::state_file().display().to_string(),
-            "backend": "x11",
-            "capabilities": crate::backend::Capabilities::x11(),
+            "backend": self.backend.as_str(),
+            "capabilities": self.capabilities(),
             "control": "agent",
             "started_at": self.started_at,
-        })
+        });
+        if self.backend == BackendKind::Wayland {
+            value["wayland_display"] = json!(self.wayland_display);
+            value["swaysock"] = json!(self
+                .swaysock
+                .as_ref()
+                .map(|path| path.display().to_string()));
+            value["output_name"] = json!(self.output_name);
+            value["xwayland_display"] = json!(self.xdisplay);
+        }
+        value
     }
 
     fn state(&self) -> State {
@@ -170,11 +196,15 @@ impl SessionInfo {
             pids: self.pids(),
             started_at: self.started_at,
             version: env!("CARGO_PKG_VERSION").to_string(),
-            backend: "x11".to_string(),
-            wayland_display: None,
-            swaysock: None,
-            output_name: None,
-            capabilities: Some(crate::backend::Capabilities::x11()),
+            backend: self.backend.as_str().to_string(),
+            wayland_display: self.wayland_display.clone(),
+            swaysock: self
+                .swaysock
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            output_name: self.output_name.clone(),
+            xwayland_display: self.xdisplay.clone(),
+            capabilities: Some(self.capabilities()),
             control: "agent".to_string(),
             control_pid: None,
             control_since: None,
@@ -201,8 +231,9 @@ pub struct ExitInfo {
 
 pub struct Session {
     pub info: SessionInfo,
+    pub backend: Backend,
     pub launched: Mutex<Vec<Launched>>,
-    /// Current display size.  RandR resizing changes this after start.
+    /// Current display size.  RandR or an output mode changes this after start.
     size: Mutex<(u32, u32)>,
     /// Numbered elements from the most recent set-of-marks screenshot.
     marks: Mutex<Vec<crate::a11y::Mark>>,
@@ -216,40 +247,23 @@ impl Session {
     /// whitelisted host variables survive, and nothing points at the host
     /// compositor, D-Bus session, or X server.
     pub fn nested_env(&self) -> Vec<(String, String)> {
-        let mut entries = env::base_environment();
-        let mut push = |key: &str, value: String| entries.push((key.to_string(), value));
+        display_env(&self.info)
+    }
 
-        push("DISPLAY", self.info.display.clone());
-        push("DBUS_SESSION_BUS_ADDRESS", self.info.dbus_address.clone());
-        push(
-            "XDG_RUNTIME_DIR",
-            self.info.runtime_dir.display().to_string(),
-        );
-        push("XAUTHORITY", self.info.xauthority.display().to_string());
-        // Never let an application fall back to the host compositor.
-        push("XDG_SESSION_TYPE", "x11".into());
-        push("GDK_BACKEND", "x11".into());
-        push("QT_QPA_PLATFORM", "xcb".into());
-        push("CLUTTER_BACKEND", "x11".into());
-        push("SDL_VIDEODRIVER", "x11".into());
-        push("MOZ_ENABLE_WAYLAND", "0".into());
-        // Accessibility backends for GTK4 and Qt.
-        push("GTK_A11Y", "atspi".into());
-        push("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1".into());
-        push("TERM", "xterm-256color".into());
-        if let Some(home) = &self.info.home {
-            for (key, path) in [
-                ("HOME", home.clone()),
-                ("XDG_CONFIG_HOME", home.join(".config")),
-                ("XDG_DATA_HOME", home.join(".local/share")),
-                ("XDG_STATE_HOME", home.join(".local/state")),
-                ("XDG_CACHE_HOME", home.join(".cache")),
-            ] {
-                let _ = std::fs::create_dir_all(&path);
-                push(key, path.display().to_string());
-            }
-        }
-        entries
+    pub fn backend(&self) -> Backend {
+        self.backend.clone()
+    }
+
+    pub fn require_pointer(&self) -> Result<()> {
+        self.backend.require_pointer()
+    }
+
+    pub fn require_keyboard(&self) -> Result<()> {
+        self.backend.require_keyboard()
+    }
+
+    pub fn require_clipboard(&self) -> Result<()> {
+        self.backend.require_clipboard()
     }
 
     pub fn width(&self) -> u32 {
@@ -266,7 +280,7 @@ impl Session {
             .unwrap_or(self.info.height)
     }
 
-    /// Record a RandR resize and refresh the state file the viewer watches.
+    /// Record a display resize and refresh the state file the viewer watches.
     pub fn set_size(&self, width: u32, height: u32) -> Result<()> {
         if let Ok(mut size) = self.size.lock() {
             *size = (width, height);
@@ -275,7 +289,7 @@ impl Session {
         info.width = width;
         info.height = height;
         state::write(&info.state())?;
-        let _ = write_root_marker(&info);
+        let _ = write_marker(&info);
         Ok(())
     }
 
@@ -439,6 +453,7 @@ impl DisplayManager {
         self.inner.lock().await.clone()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         width: u32,
@@ -446,9 +461,14 @@ impl DisplayManager {
         visible: bool,
         session_id: Option<String>,
         persist_home: bool,
+        backend: BackendKind,
+        xwayland: bool,
     ) -> Result<StartReport> {
         if !(64..=8192).contains(&width) || !(64..=8192).contains(&height) {
             bail!("width and height must be between 64 and 8192 pixels");
+        }
+        if backend == BackendKind::X11 && xwayland {
+            bail!("xwayland is only meaningful with backend=\"wayland\"");
         }
         let session_id = match session_id {
             Some(id) => {
@@ -479,6 +499,56 @@ impl DisplayManager {
         let stale = state::cleanup_stale();
         let mut warnings: Vec<String> = stale;
 
+        let info = match backend {
+            BackendKind::X11 => {
+                self.launch_x11(
+                    width,
+                    height,
+                    visible,
+                    &session_id,
+                    persist_home,
+                    &mut warnings,
+                )
+                .await?
+            }
+            BackendKind::Wayland => {
+                self.launch_wayland(
+                    width,
+                    height,
+                    visible,
+                    &session_id,
+                    persist_home,
+                    xwayland,
+                    &mut warnings,
+                )
+                .await?
+            }
+        };
+
+        state::write(&info.state())?;
+        write_marker(&info)?;
+        let session = Arc::new(Session {
+            info: info.clone(),
+            backend: Backend::from_info(&info),
+            launched: Mutex::new(Vec::new()),
+            size: Mutex::new((info.width, info.height)),
+            marks: Mutex::new(Vec::new()),
+            exits: Mutex::new(std::collections::HashMap::new()),
+            launch_seq: AtomicU64::new(0),
+        });
+        *guard = Some(session);
+        Ok(StartReport { info, warnings })
+    }
+
+    async fn launch_x11(
+        &self,
+        width: u32,
+        height: u32,
+        visible: bool,
+        session_id: &str,
+        persist_home: bool,
+        warnings: &mut Vec<String>,
+    ) -> Result<SessionInfo> {
         let server_tool = if visible {
             if env::host_display().is_none() {
                 bail!(
@@ -534,26 +604,13 @@ impl DisplayManager {
                     &server_tool,
                     &xserver_name,
                     server_pid,
-                    &session_id,
+                    session_id,
                     persist_home,
-                    &mut warnings,
+                    warnings,
                 )
                 .await
             {
-                Ok(info) => {
-                    state::write(&info.state())?;
-                    write_root_marker(&info)?;
-                    let session = Arc::new(Session {
-                        info: info.clone(),
-                        launched: Mutex::new(Vec::new()),
-                        size: Mutex::new((info.width, info.height)),
-                        marks: Mutex::new(Vec::new()),
-                        exits: Mutex::new(std::collections::HashMap::new()),
-                        launch_seq: AtomicU64::new(0),
-                    });
-                    *guard = Some(session);
-                    return Ok(StartReport { info, warnings });
-                }
+                Ok(info) => return Ok(info),
                 Err(err) => {
                     last_error = Some(err);
                     // Try the next display number; a lock file can be stale or
@@ -564,6 +621,196 @@ impl DisplayManager {
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("could not find a free X display number")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn launch_wayland(
+        &self,
+        width: u32,
+        height: u32,
+        visible: bool,
+        session_id: &str,
+        persist_home: bool,
+        xwayland: bool,
+        warnings: &mut Vec<String>,
+    ) -> Result<SessionInfo> {
+        let sway_tool = self
+            .tools
+            .sway
+            .clone()
+            .ok_or_else(|| anyhow!(missing_sway_hint()))?;
+        if self.tools.dbus_launch.is_none() {
+            bail!("dbus-launch was not found; install the dbus package");
+        }
+
+        let number = 0u32;
+        let runtime_dir = state::session_dir(number, std::process::id());
+        env::create_private_dir(&runtime_dir)
+            .with_context(|| format!("cannot create {}", runtime_dir.display()))?;
+        let log_dir = runtime_dir.join("logs");
+        env::create_private_dir(&log_dir)?;
+
+        let home = if persist_home {
+            let home = state::session_home(session_id)?;
+            env::create_private_dir(&home)?;
+            for child in [".config", ".local/share", ".local/state", ".cache"] {
+                let _ = std::fs::create_dir_all(home.join(child));
+            }
+            Some(home)
+        } else {
+            None
+        };
+
+        let bus = match start_private_bus(&runtime_dir).await {
+            Ok(bus) => bus,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&runtime_dir);
+                return Err(err);
+            }
+        };
+
+        let host = if visible {
+            match host_surface() {
+                Some(host) => Some(host),
+                None => {
+                    abort_wayland(&runtime_dir, 0, &bus);
+                    bail!(
+                        "visible=true needs a host Wayland or X11 session for the nested \
+                         compositor window, but neither WAYLAND_DISPLAY nor DISPLAY is usable. \
+                         Use visible=false for a headless sway session."
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+        let config = match sway::config(&runtime_dir, width, height, xwayland) {
+            Ok(config) => config,
+            Err(err) => {
+                abort_wayland(&runtime_dir, 0, &bus);
+                return Err(err);
+            }
+        };
+
+        let log = log_dir.join("sway.log");
+        let mut cmd = Command::new(&sway_tool.path);
+        cmd.env_clear();
+        cmd.arg("-c").arg(&config);
+        let mut entries = env::base_environment();
+        entries.push(("XDG_RUNTIME_DIR".into(), runtime_dir.display().to_string()));
+        entries.push(("XDG_SESSION_TYPE".into(), "wayland".into()));
+        entries.push(("WLR_RENDERER".into(), "pixman".into()));
+        entries.push(("WLR_LIBINPUT_NO_DEVICES".into(), "1".into()));
+        match &host {
+            None => entries.push(("WLR_BACKENDS".into(), "headless".into())),
+            Some(HostSurface::Wayland(socket)) => {
+                entries.push(("WLR_BACKENDS".into(), "wayland".into()));
+                entries.push(("WAYLAND_DISPLAY".into(), socket.display().to_string()));
+            }
+            Some(HostSurface::X11 {
+                display,
+                xauthority,
+            }) => {
+                entries.push(("WLR_BACKENDS".into(), "x11".into()));
+                entries.push(("DISPLAY".into(), display.clone()));
+                if let Some(auth) = xauthority {
+                    entries.push(("XAUTHORITY".into(), auth.to_string_lossy().into_owned()));
+                }
+            }
+        }
+        apply_env(&mut cmd, &entries);
+        apply_env(&mut cmd, &sway_tool.extra);
+        let pid = match spawn_logged(&mut cmd, &log) {
+            Ok(pid) => pid,
+            Err(err) => {
+                abort_wayland(&runtime_dir, 0, &bus);
+                return Err(err).with_context(|| {
+                    format!(
+                        "cannot start {}: {}",
+                        sway_tool.path.display(),
+                        proc::tail(&log, 5)
+                    )
+                });
+            }
+        };
+
+        let (display, swaysock) =
+            match sway::wait_ready(&runtime_dir, pid, &log, Duration::from_secs(12)).await {
+                Ok(result) => result,
+                Err(err) => {
+                    abort_wayland(&runtime_dir, pid, &bus);
+                    return Err(
+                        err.context(format!("sway did not start in {}", runtime_dir.display()))
+                    );
+                }
+            };
+        let (output, actual_width, actual_height) =
+            match sway::wait_output(&swaysock, width, height, Duration::from_secs(4)).await {
+                Ok(result) => result,
+                Err(err) => {
+                    abort_wayland(&runtime_dir, pid, &bus);
+                    return Err(err);
+                }
+            };
+        if (actual_width, actual_height) != (width, height) {
+            if let Err(err) = sway::resize_output(&swaysock, &output, width, height) {
+                warnings.push(format!(
+                    "sway started at {actual_width}x{actual_height} and the requested {width}x{height} mode failed: {err:#}"
+                ));
+            }
+        }
+
+        let xdisplay = if xwayland {
+            let found =
+                wait_xwayland_display(&swaysock, &runtime_dir, Duration::from_secs(4)).await;
+            if found.is_none() {
+                warnings.push(
+                    "xwayland=true but no Xwayland DISPLAY appeared; X11-only apps may fail to start"
+                        .into(),
+                );
+            }
+            found
+        } else {
+            None
+        };
+
+        let mut info = SessionInfo {
+            session_id: session_id.to_string(),
+            number,
+            display: display.clone(),
+            width,
+            height,
+            visible,
+            xserver: "sway".to_string(),
+            wm: None,
+            dbus_address: bus.address,
+            dbus_pid: bus.pid,
+            dbus_group: bus.group_pid,
+            xserver_pid: pid,
+            wm_pid: None,
+            a11y_registry_pid: None,
+            a11y_ready: false,
+            runtime_dir: runtime_dir.clone(),
+            xauthority: runtime_dir.join("Xauthority"),
+            log_dir: log_dir.clone(),
+            home,
+            persistent_home: persist_home,
+            started_at: state::now(),
+            backend: BackendKind::Wayland,
+            wayland_display: Some(display),
+            swaysock: Some(swaysock),
+            output_name: Some(output),
+            xdisplay,
+        };
+
+        let nested = display_env(&info);
+        let a11y = init_accessibility(&info.dbus_address, &info.log_dir, &nested).await;
+        info.a11y_ready = a11y.ready;
+        info.a11y_registry_pid = a11y.registry_pid;
+        warnings.extend(a11y.warnings);
+
+        Ok(info)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -702,6 +949,11 @@ impl DisplayManager {
             home,
             persistent_home: persist_home,
             started_at: state::now(),
+            backend: BackendKind::X11,
+            wayland_display: None,
+            swaysock: None,
+            output_name: None,
+            xdisplay: None,
         };
 
         // Window manager.
@@ -742,7 +994,12 @@ impl DisplayManager {
         // lives under our private XDG_RUNTIME_DIR.  The registry is started
         // explicitly because D-Bus activation can collide with the host's
         // systemd user unit.
-        let a11y = init_accessibility(&info, &runtime_dir, &xauthority).await;
+        let a11y = init_accessibility(
+            &info.dbus_address,
+            &info.log_dir,
+            &info_env(&info, &runtime_dir, &xauthority),
+        )
+        .await;
         info.a11y_ready = a11y.ready;
         info.a11y_registry_pid = a11y.registry_pid;
         warnings.extend(a11y.warnings);
@@ -771,6 +1028,21 @@ impl DisplayManager {
         let mut pids = info.pids();
         pids.extend(launched);
         pids.retain(|pid| *pid > 0);
+
+        // Ask sway to exit before signalling the group: that gives clients a
+        // chance to shut down and removes the compositor's sockets cleanly.
+        if let Some(socket) = info.swaysock.clone() {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = sway::Sway::new(socket).run("exit");
+            })
+            .await;
+            for _ in 0..20 {
+                if !proc::alive(info.xserver_pid) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
 
         // Kill every group at once, then the individual bus PID in case the
         // daemon left its original process group.
@@ -929,9 +1201,12 @@ struct A11yInit {
     warnings: Vec<String>,
 }
 
-async fn init_accessibility(info: &SessionInfo, runtime_dir: &Path, xauthority: &Path) -> A11yInit {
+async fn init_accessibility(
+    bus_address: &str,
+    log_dir: &Path,
+    nested: &[(String, String)],
+) -> A11yInit {
     let mut warnings = Vec::new();
-    let nested = info_env(info, runtime_dir, xauthority);
     let Some(gdbus) = env::find_tool("gdbus", env::runtime_root().as_deref()) else {
         warnings.push("gdbus not found; AT-SPI status could not be enabled".into());
         return A11yInit {
@@ -946,7 +1221,7 @@ async fn init_accessibility(info: &SessionInfo, runtime_dir: &Path, xauthority: 
         cmd.env_clear();
         cmd.arg("call")
             .arg("--address")
-            .arg(&info.dbus_address)
+            .arg(bus_address)
             .arg("--dest")
             .arg("org.a11y.Bus")
             .arg("--object-path")
@@ -960,7 +1235,7 @@ async fn init_accessibility(info: &SessionInfo, runtime_dir: &Path, xauthority: 
 
     let mut address_ok = false;
     let mut cmd = base(&["org.a11y.Bus.GetAddress"]);
-    apply_env(&mut cmd, &nested);
+    apply_env(&mut cmd, nested);
     match proc::run_output(cmd, Duration::from_secs(5)).await {
         Ok(out) if out.ok() => address_ok = true,
         Ok(out) => warnings.push(format!(
@@ -978,7 +1253,7 @@ async fn init_accessibility(info: &SessionInfo, runtime_dir: &Path, xauthority: 
             "IsEnabled",
             "<true>",
         ]);
-        apply_env(&mut cmd, &nested);
+        apply_env(&mut cmd, nested);
         match proc::run_output(cmd, Duration::from_secs(5)).await {
             Ok(out) if out.ok() => enabled_ok = true,
             Ok(out) => warnings.push(format!(
@@ -992,10 +1267,10 @@ async fn init_accessibility(info: &SessionInfo, runtime_dir: &Path, xauthority: 
     let mut registry_pid = None;
     if enabled_ok {
         if let Some(registryd) = &env::find_registryd() {
-            let log = info.log_dir.join("a11y-registry.log");
+            let log = log_dir.join("a11y-registry.log");
             let mut cmd = Command::new(registryd);
             cmd.env_clear();
-            apply_env(&mut cmd, &nested);
+            apply_env(&mut cmd, nested);
             match spawn_logged(&mut cmd, &log) {
                 Ok(pid) => {
                     tokio::time::sleep(Duration::from_millis(180)).await;
@@ -1023,6 +1298,130 @@ async fn init_accessibility(info: &SessionInfo, runtime_dir: &Path, xauthority: 
         ready: enabled_ok,
         registry_pid,
         warnings,
+    }
+}
+
+/// Environment for every process that should see the nested desktop.  The
+/// backend owns the difference; callers only add per-process extras.
+fn display_env(info: &SessionInfo) -> Vec<(String, String)> {
+    match info.backend {
+        BackendKind::X11 => info_env(info, &info.runtime_dir, &info.xauthority),
+        BackendKind::Wayland => wayland_env(info),
+    }
+}
+
+fn wayland_env(info: &SessionInfo) -> Vec<(String, String)> {
+    let mut entries = env::base_environment();
+    let mut push = |key: &str, value: String| entries.push((key.to_string(), value));
+
+    push("DBUS_SESSION_BUS_ADDRESS", info.dbus_address.clone());
+    push("XDG_RUNTIME_DIR", info.runtime_dir.display().to_string());
+    if let Some(display) = &info.wayland_display {
+        push("WAYLAND_DISPLAY", display.clone());
+    }
+    // Never let an application fall back to the host compositor.
+    push("XDG_SESSION_TYPE", "wayland".into());
+    push("GDK_BACKEND", "wayland,x11".into());
+    push("QT_QPA_PLATFORM", "wayland;xcb".into());
+    push("CLUTTER_BACKEND", "wayland".into());
+    push("SDL_VIDEODRIVER", "wayland,x11".into());
+    push("MOZ_ENABLE_WAYLAND", "1".into());
+    push("GTK_A11Y", "atspi".into());
+    push("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1".into());
+    push("TERM", "xterm-256color".into());
+    if let Some(display) = &info.xdisplay {
+        push("DISPLAY", display.clone());
+    }
+    if let Some(home) = &info.home {
+        for (key, path) in [
+            ("HOME", home.clone()),
+            ("XDG_CONFIG_HOME", home.join(".config")),
+            ("XDG_DATA_HOME", home.join(".local/share")),
+            ("XDG_STATE_HOME", home.join(".local/state")),
+            ("XDG_CACHE_HOME", home.join(".cache")),
+        ] {
+            let _ = std::fs::create_dir_all(&path);
+            push(key, path.display().to_string());
+        }
+    }
+    entries
+}
+
+enum HostSurface {
+    Wayland(PathBuf),
+    X11 {
+        display: String,
+        xauthority: Option<PathBuf>,
+    },
+}
+
+/// The host surface a nested compositor can open a window on.  A relative
+/// host WAYLAND_DISPLAY is resolved against the host XDG_RUNTIME_DIR before
+/// the child sees it, because the child gets a private runtime directory.
+fn host_surface() -> Option<HostSurface> {
+    if let Some(value) = std::env::var_os("WAYLAND_DISPLAY") {
+        let raw = PathBuf::from(value);
+        let path = if raw.is_absolute() {
+            raw
+        } else {
+            PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join(raw)
+        };
+        if path.exists() {
+            return Some(HostSurface::Wayland(path));
+        }
+    }
+    env::host_display().map(|display| HostSurface::X11 {
+        display,
+        xauthority: env::host_xauthority().map(PathBuf::from),
+    })
+}
+
+fn abort_wayland(runtime_dir: &Path, pid: u32, bus: &BusInfo) {
+    if pid > 0 {
+        proc::kill_group(pid, libc::SIGTERM);
+        proc::signal_process(pid, libc::SIGTERM);
+    }
+    proc::kill_group(bus.group_pid, libc::SIGTERM);
+    proc::signal_process(bus.pid, libc::SIGTERM);
+    let _ = std::fs::remove_dir_all(runtime_dir);
+}
+
+/// Sway sets DISPLAY for commands it executes, but `/proc/<pid>/environ` still
+/// shows the environment sway started with.  Ask sway to run a one-line
+/// helper in its own environment and write the value into the private runtime
+/// directory.  This avoids guessing from the host-global /tmp/.X11-unix
+/// namespace.
+async fn wait_xwayland_display(
+    swaysock: &Path,
+    runtime_dir: &Path,
+    timeout: Duration,
+) -> Option<String> {
+    let marker = runtime_dir.join("xwayland-display");
+    let _ = std::fs::remove_file(&marker);
+    let command = format!(
+        "exec sh -c 'printf %s \"$DISPLAY\" > \"{}\"'",
+        marker.display()
+    );
+    if sway::Sway::new(swaysock.to_path_buf())
+        .run(&command)
+        .is_err()
+    {
+        return None;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&marker) {
+            let text = text.trim().to_string();
+            let _ = std::fs::remove_file(&marker);
+            if text.starts_with(':') {
+                return Some(text);
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = std::fs::remove_file(&marker);
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
     }
 }
 
@@ -1081,6 +1480,21 @@ fn spawn_logged(cmd: &mut Command, log: &Path) -> Result<u32> {
     Ok(child.id().unwrap_or(0))
 }
 
+fn write_marker(info: &SessionInfo) -> Result<()> {
+    if info.backend == BackendKind::X11 {
+        return write_root_marker(info);
+    }
+    // The X11 root property has no Wayland equivalent.  Put the same JSON
+    // next to the socket so discovery still works without the shared state
+    // directory.
+    use std::os::unix::fs::PermissionsExt;
+    let path = info.runtime_dir.join("xephyr-mcp-session.json");
+    std::fs::write(&path, info.state().marker_json())
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
 fn write_root_marker(info: &SessionInfo) -> Result<()> {
     let (conn, screen_num) = crate::x11::connect(&info.display)?;
     let atom = crate::x11::atom(&conn, state::ROOT_MARKER)?;
@@ -1126,6 +1540,12 @@ fn missing_xephyr_hint() -> String {
 fn missing_xvfb_hint() -> String {
     "Xvfb was not found. Install xorg-server-xvfb, or run \
      ./scripts/fetch-runtime.sh to install a private copy."
+        .into()
+}
+
+fn missing_sway_hint() -> String {
+    "sway was not found. Install the sway package, or run \
+     ./scripts/fetch-runtime.sh --wayland to install a private copy."
         .into()
 }
 

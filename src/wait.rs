@@ -1,10 +1,10 @@
 //! Blocking UI conditions: window appearance, process exit, frame stability,
 //! and region changes.  These replace screenshot polling in agent loops.
 
+use crate::backend::{Backend, CaptureRect, CaptureTarget};
 use crate::display::Session;
 use crate::proc;
 use crate::screenshot::{self, Frame};
-use crate::windows;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -49,7 +49,7 @@ pub struct WaitSpec {
 }
 
 pub async fn run(session: &Session, spec: &WaitSpec) -> Result<Value> {
-    let display = session.info.display.clone();
+    let backend = session.backend();
     let started = Instant::now();
     let deadline = started + spec.timeout;
     let poll = spec.poll.max(Duration::from_millis(20));
@@ -69,7 +69,7 @@ pub async fn run(session: &Session, spec: &WaitSpec) -> Result<Value> {
                 title,
                 class,
                 appear,
-            } => match windows::list(&display) {
+            } => match backend.windows() {
                 Ok(list) => {
                     let matches: Vec<Value> = list
                         .iter()
@@ -118,7 +118,7 @@ pub async fn run(session: &Session, spec: &WaitSpec) -> Result<Value> {
                 }
             }
             Condition::ScreenStable { region, stable_ms } => {
-                match capture_hash(&display, *region) {
+                match capture_hash(&backend, *region) {
                     Ok(hash) => {
                         if last_hash != Some(hash) {
                             last_hash = Some(hash);
@@ -143,7 +143,7 @@ pub async fn run(session: &Session, spec: &WaitSpec) -> Result<Value> {
                     Err(err) => last_error = Some(format!("{err:#}")),
                 }
             }
-            Condition::RegionChange { region } => match capture_hash(&display, Some(*region)) {
+            Condition::RegionChange { region } => match capture_hash(&backend, Some(*region)) {
                 Ok(hash) => {
                     if baseline.is_none() {
                         baseline = Some(hash);
@@ -217,13 +217,18 @@ fn region_json(region: Option<Region>) -> Value {
     }
 }
 
-fn capture_hash(display: &str, region: Option<Region>) -> Result<u64> {
-    let frame: Frame = match region {
-        Some(region) => {
-            screenshot::capture_region(display, region.x, region.y, region.width, region.height)?
-        }
-        None => screenshot::capture(display)?,
-    };
+fn capture_hash(backend: &Backend, region: Option<Region>) -> Result<u64> {
+    let target = region
+        .map(|region| {
+            CaptureTarget::Region(CaptureRect {
+                x: i32::from(region.x),
+                y: i32::from(region.y),
+                width: u32::from(region.width),
+                height: u32::from(region.height),
+            })
+        })
+        .unwrap_or(CaptureTarget::Output);
+    let frame: Frame = backend.capture(&target, false)?.frame;
     Ok(screenshot::hash(&frame))
 }
 

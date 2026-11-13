@@ -1,8 +1,10 @@
 # Wayland backend
 
-Status: design validated against sway 1.12 + wlroots 0.20 (2026-11-13).
-The backend-neutral state/capability schema has landed; the Wayland backend is
-not wired into the tools yet.
+Status: phase 2 implemented and validated against sway 1.12 + wlroots 0.20
+(2026-11-13). The `Backend` seam, headless/nested sway lifecycle, screencopy
+capture, sway-IPC window control, floating move/resize, and output-mode resize
+are live. Wayland pointer/keyboard injection and data-control clipboard are the
+next phase.
 
 The X11 backend stays the default. This document describes the seam that lets a
 Wayland session exist beside it, the protocol mapping, and the parts of the
@@ -105,6 +107,14 @@ XWayland is optional and defaults to **disabled**. It creates a socket in
 enable it explicitly for X11-only test apps. Input still goes through the
 Wayland virtual devices, so XTEST is not used for Wayland sessions even when
 XWayland is on.
+
+Xwayland's DISPLAY is not visible in `/proc/<sway-pid>/environ`: sway calls
+`setenv` after start, and `/proc` still reports the initial environment. The
+server asks sway to run a one-line helper (`exec sh -c 'printf %s "$DISPLAY"
+> <runtime>/xwayland-display'`) and reads that file. This avoids guessing from
+the host-global socket namespace. Verified with `xmessage`: the app received
+`DISPLAY=:2`, appeared in `list_windows`, and its Xwayland exited with
+`display_stop`.
 
 ### Generated sway config
 
@@ -373,28 +383,28 @@ host path (and host `DISPLAY`/`XAUTHORITY` for `WLR_BACKENDS=x11`).
 
 ## Phases
 
-1. **Seam.** Move capture/input/windows/clipboard/resize behind `Backend`;
-   X11 implementation is a mechanical wrapper. Add `capabilities()` and
-   `backend` to session JSON. No behavior change; existing tests and the 35-tool
-   catalog stay identical.
-2. **Wayland lifecycle + capture.** Sway discovery/runtime, private bus and
+1. **Seam.** ✅ `Backend` in `src/backend.rs` dispatches capture, windows,
+   resize, clipboard, and capability errors. X11 is a mechanical wrapper;
+   existing tests and the 35-tool catalog are unchanged.
+2. **Wayland lifecycle + capture.** ✅ Sway discovery/runtime, private bus and
    AT-SPI, generated config, `output * mode`, socket discovery, state/marker,
-   `display_stop` via `swaymsg exit` + group sweep. Screencopy capture with the
-   existing fit/resize/PNG code. `display_start backend=wayland` (headless
-   first), `resize_display` via output mode.
-3. **Wayland windows and input.** Sway IPC `get_tree`, foreign-toplevel list,
-   activate/close, floating-only move/resize with confirmation polling,
-   virtual pointer and keyboard, data-control clipboard. Add the `xwayland`
-   option (default off), launch env, and the XWayland bridge warm-up decision.
-4. **Viewer + control.** Screencopy client, state-based discovery, `c` toggle,
-   `control` in state, server-side input refusal, `wait_for_control`, no trace
-   screenshots during human control, optional blank/redacted capture. For
-   nested sessions, enforce the lock by attaching the wayland-backend devices
-   to a `locked` seat (and reattaching on release); for headless sessions, use
-   viewer forwarding.
-5. **Polish.** Nested mode on both host types, per-window capture via
+   `display_stop` via `swaymsg exit` + group sweep. Screencopy capture reuses
+   the existing fit/resize/PNG code. `display_start backend=wayland` (headless
+   and nested), `resize_display` via output mode, optional XWayland.
+3. **Wayland windows and input.** Windows ✅ via sway IPC `get_tree`,
+   activate/close, floating-only move/resize with confirmation polling.
+   **Remaining:** `zwlr_virtual_pointer_v1` + `zwp_virtual_keyboard_v1`
+   injection and data-control clipboard.
+4. **Viewer + control.** **Planned.** Screencopy client, state-based discovery,
+   `c` toggle, `control` in state, server-side input refusal,
+   `wait_for_control`, no trace screenshots during human control, optional
+   blank/redacted capture. For nested sessions, enforce the lock by attaching
+   the wayland-backend devices to a `locked` seat (and reattaching on release);
+   for headless sessions, use viewer forwarding.
+5. **Polish.** **Planned.** Per-window capture via
    `ext-foreign-toplevel-image-capture-source`, labwc support or an explicit
-   capability error, packaging, docs, smoke tests in CI.
+   capability error, packaging, docs, smoke tests in CI. Nested mode is
+   already validated on both host surfaces.
 
 ## Acceptance tests
 

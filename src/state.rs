@@ -47,6 +47,9 @@ pub struct State {
     pub swaysock: Option<String>,
     #[serde(default)]
     pub output_name: Option<String>,
+    /// XWayland's DISPLAY when the Wayland session enables it.
+    #[serde(default)]
+    pub xwayland_display: Option<String>,
     #[serde(default)]
     pub capabilities: Option<Capabilities>,
     /// "agent" or "human"; viewer/session arbitration.
@@ -340,7 +343,7 @@ mod tests {
         assert_eq!(decoded.backend, "wayland");
         assert_eq!(
             decoded.capabilities.unwrap().clipboard,
-            crate::backend::ClipboardPath::DataControl
+            crate::backend::ClipboardPath::None
         );
     }
 }

@@ -17,10 +17,12 @@ pub mod proc;
 pub mod randr;
 pub mod screenshot;
 pub mod state;
+pub mod sway;
 pub mod tools;
 pub mod trace;
 pub mod viewer;
 pub mod wait;
+pub mod wayland;
 pub mod windows;
 pub mod x11;
 

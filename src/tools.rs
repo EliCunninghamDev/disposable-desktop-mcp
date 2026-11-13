@@ -1,9 +1,10 @@
 //! Tool definitions and handlers.
 
+use crate::backend::{self, BackendKind, CaptureRect, CaptureTarget};
 use crate::display::{DisplayManager, Session};
 use crate::env::Tool;
 use crate::mcp::CallResult;
-use crate::{a11y, clipboard, input, proc, randr, screenshot, trace, wait, windows, x11};
+use crate::{a11y, input, proc, screenshot, trace, wait, x11};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
@@ -21,18 +22,21 @@ type ScreenshotOutput = (
     u32,
     Option<(i32, i32)>,
     Option<screenshot::CursorMethod>,
+    bool,
 );
 
 pub fn definitions() -> Vec<Value> {
     vec![
         tool(
             "display_start",
-            "Start a private, disposable nested X desktop for GUI testing, screenshots, mouse/keyboard automation, and window management. Call this before any other xephyr-mcp tool. visible=true launches Xephyr (a watchable window) on the host X11/XWayland display; visible=false launches headless Xvfb. Also starts a window manager and private D-Bus/AT-SPI buses so launched apps cannot reach the host session bus. Each server process owns one display: call display_stop before starting another, or run separate server instances with distinct session_id values for parallel desktops. Returns display, pids, dbus_address, runtime/log/home dirs, trace path, and accessibility status.",
+            "Start a private, disposable nested desktop for GUI testing, screenshots, mouse/keyboard automation, and window management. Call this before any other xephyr-mcp tool. backend=\"x11\" (default) uses Xephyr (visible=true, a watchable window on the host X11/XWayland display) or headless Xvfb (visible=false). backend=\"wayland\" uses sway: visible=false is a headless compositor (the Xvfb analog) and visible=true opens a nested window on the host Wayland or X11 session (the Xephyr analog). X11 sessions get a window manager and private D-Bus/AT-SPI buses; Wayland sessions get sway, a private runtime dir, and the same private buses. Each server process owns one display: call display_stop before starting another, or run separate server instances with distinct session_id values for parallel desktops. Returns display, backend, capabilities, pids, dbus_address, runtime/log/home dirs, trace path, and accessibility status.",
             schema(
                 json!({
                     "width": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Screen width in pixels (default 1280)" },
                     "height": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Screen height in pixels (default 800)" },
-                    "visible": { "type": "boolean", "description": "Xephyr window (true, default) or headless Xvfb (false)" },
+                    "backend": { "type": "string", "enum": ["x11", "wayland"], "description": "Display backend (default x11). wayland uses sway and exposes capture, window control, and resize; input and clipboard are not wired yet." },
+                    "visible": { "type": "boolean", "description": "Open a window on the host desktop (true, default) or run headless (false)" },
+                    "xwayland": { "type": "boolean", "description": "wayland only: start XWayland so X11-only apps get a DISPLAY (default false; adds a host-global /tmp/.X11-unix socket)" },
                     "session_id": { "type": "string", "description": "Optional caller-supplied identifier (1-64 letters/digits/-_.). Used by the viewer and to keep multiple server instances apart. Generated if omitted." },
                     "persist_home": { "type": "boolean", "description": "Keep HOME and XDG directories under the state dir keyed by session_id, so app profiles survive display_stop/display_start (default false)" }
                 }),
@@ -46,7 +50,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "launch",
-            "Launch an application or shell command inside the nested display. The binary comes from the host filesystem, but DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR, and the session/accessibility buses point at the private desktop; WAYLAND_DISPLAY is removed. Uses 'sh -c', so pipelines and quoting work. The process runs in its own group and keeps running after this call returns, even if its window closes or its screenshot is already written; running:true means it is still alive. Returns the PID and log path. Use wait_ms to detect immediate crashes, launch_status to check later, kill_process all=true to stop everything you launched, and display_stop to tear the desktop down and reap all of it.",
+            "Launch an application or shell command inside the nested display. The binary comes from the host filesystem, but DISPLAY/XAUTHORITY (X11), WAYLAND_DISPLAY (Wayland), XDG_RUNTIME_DIR, and the session/accessibility buses point at the private desktop while host display variables are removed. Uses 'sh -c', so pipelines and quoting work. The process runs in its own group and keeps running after this call returns, even if its window closes or its screenshot is already written; running:true means it is still alive. Returns the PID and log path. Use wait_ms to detect immediate crashes, launch_status to check later, kill_process all=true to stop everything you launched, and display_stop to tear the desktop down and reap all of it.",
             schema(
                 json!({
                     "command": { "type": "string", "description": "Shell command to run, e.g. 'zenity --info --text hello' or 'xterm -e top'" },
@@ -544,15 +548,19 @@ struct Capture {
 }
 
 async fn capture_state(session: Option<&Arc<Session>>, with_png: bool) -> Option<Capture> {
-    let display = session?.info.display.clone();
+    let backend = session?.backend();
     tokio::task::spawn_blocking(move || {
-        screenshot::capture(&display).ok().map(|frame| {
-            let hash = format!("{:016x}", screenshot::hash(&frame));
-            let png = with_png
-                .then(|| screenshot::encode_png(frame.width, frame.height, &frame.rgba).ok())
-                .flatten();
-            Capture { hash, png }
-        })
+        backend
+            .capture(&CaptureTarget::Output, false)
+            .ok()
+            .map(|capture| {
+                let frame = capture.frame;
+                let hash = format!("{:016x}", screenshot::hash(&frame));
+                let png = with_png
+                    .then(|| screenshot::encode_png(frame.width, frame.height, &frame.rgba).ok())
+                    .flatten();
+                Capture { hash, png }
+            })
     })
     .await
     .ok()
@@ -580,10 +588,28 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             let width = opt_u64(args, "width").unwrap_or(1280) as u32;
             let height = opt_u64(args, "height").unwrap_or(800) as u32;
             let visible = opt_bool(args, "visible").unwrap_or(true);
+            let backend = match opt_str(args, "backend").unwrap_or("x11") {
+                "x11" => BackendKind::X11,
+                "wayland" => BackendKind::Wayland,
+                other => {
+                    return Err(anyhow!(
+                        "backend must be \"x11\" or \"wayland\", got {other:?}"
+                    ))
+                }
+            };
+            let xwayland = opt_bool(args, "xwayland").unwrap_or(false);
             let session_id = opt_str(args, "session_id").map(str::to_string);
             let persist_home = opt_bool(args, "persist_home").unwrap_or(false);
             let report = manager
-                .start(width, height, visible, session_id, persist_home)
+                .start(
+                    width,
+                    height,
+                    visible,
+                    session_id,
+                    persist_home,
+                    backend,
+                    xwayland,
+                )
                 .await?;
             Ok(CallResult::text(&report.to_json()))
         }
@@ -640,29 +666,46 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         "screenshot" => {
             let session = active(manager).await?;
             let region = args.get("region").map(wait::parse_region).transpose()?;
-            let window_id = match args.get("window_id") {
+            let backend = session.backend();
+            let capabilities = backend.capabilities();
+            let handle = match args.get("window_id") {
                 Some(Value::Null) | None => None,
-                Some(value) => Some(x11::parse_window_id(value)?),
+                Some(value) => Some(backend::parse_window_handle(value, backend.kind())?),
             };
+            if handle.is_some() && !capabilities.capture_window {
+                return Err(anyhow!(
+                    "per-window capture is not available on the {} backend; capture the output \
+                     and use region= with the window rect from list_windows",
+                    backend.kind().as_str()
+                ));
+            }
             let cursor = opt_bool(args, "cursor").unwrap_or(false);
             let grid = opt_bool(args, "grid").unwrap_or(false);
             let marks_requested = opt_bool(args, "marks").unwrap_or(false);
             let mark_limit = opt_u64(args, "mark_limit").unwrap_or(60).clamp(1, 200) as u32;
             // Crops default to native resolution: downscaling a small region
             // is exactly what destroys text legibility.
-            let native =
-                opt_bool(args, "native").unwrap_or(region.is_some() || window_id.is_some());
+            let native = opt_bool(args, "native").unwrap_or(region.is_some() || handle.is_some());
             let max_width = opt_u64(args, "max_width").unwrap_or(1280).clamp(64, 4096) as u32;
             let max_height = opt_u64(args, "max_height").unwrap_or(800).clamp(64, 4096) as u32;
-            let display = session.info.display.clone();
             let display_width = session.width();
             let display_height = session.height();
-            let kind = if window_id.is_some() {
+            let kind = if handle.is_some() {
                 "window"
             } else if region.is_some() {
                 "region"
             } else {
                 "root"
+            };
+            let target = match (&handle, region) {
+                (Some(handle), _) => CaptureTarget::Window(handle.clone()),
+                (None, Some(region)) => CaptureTarget::Region(CaptureRect {
+                    x: region.x as i32,
+                    y: region.y as i32,
+                    width: region.width as u32,
+                    height: region.height as u32,
+                }),
+                (None, None) => CaptureTarget::Output,
             };
 
             let (marks_value, mark_list) = if marks_requested {
@@ -683,62 +726,52 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                 .map(|mark| (mark.mark, mark.x, mark.y, mark.width, mark.height))
                 .collect();
 
-            let (png, source_width, source_height, width, height, origin, cursor_method) =
-                tokio::task::spawn_blocking(move || -> Result<ScreenshotOutput> {
-                    let mut frame = if let Some(window) = window_id {
-                        screenshot::capture_window(&display, window)?
-                    } else if let Some(region) = region {
-                        screenshot::capture_region(
-                            &display,
-                            region.x,
-                            region.y,
-                            region.width,
-                            region.height,
-                        )?
-                    } else {
-                        screenshot::capture(&display)?
-                    };
-                    let origin = if let Some(window) = window_id {
-                        Some(screenshot::window_origin(&display, window)?)
-                    } else {
-                        region.map(|region| (region.x as i32, region.y as i32))
-                    };
-                    let mut cursor_method = None;
-                    if cursor {
-                        let (ox, oy) = origin.unwrap_or((0, 0));
-                        cursor_method = screenshot::overlay_cursor(&display, &mut frame, ox, oy)
-                            .ok()
-                            .flatten();
-                    }
-                    if grid {
-                        let spacing = if frame.width < 500 { 50 } else { 100 };
-                        screenshot::overlay_grid(&mut frame, spacing);
-                    }
-                    if !mark_boxes.is_empty() {
-                        let (ox, oy) = origin.unwrap_or((0, 0));
-                        screenshot::draw_marks(&mut frame, &mark_boxes, ox, oy);
-                    }
-                    let source_width = frame.width;
-                    let source_height = frame.height;
-                    let (width, height) = if native {
-                        (frame.width, frame.height)
-                    } else {
-                        screenshot::fit(frame.width, frame.height, max_width, max_height)
-                    };
-                    let scaled = screenshot::resize(&frame, width, height);
-                    let png = screenshot::encode_png(width, height, &scaled)?;
-                    Ok((
-                        png,
-                        source_width,
-                        source_height,
-                        width,
-                        height,
-                        origin,
-                        cursor_method,
-                    ))
-                })
-                .await
-                .context("screenshot task failed")??;
+            let target_for_capture = target.clone();
+            let (
+                png,
+                source_width,
+                source_height,
+                width,
+                height,
+                origin,
+                cursor_method,
+                cursor_drawn,
+            ) = tokio::task::spawn_blocking(move || -> Result<ScreenshotOutput> {
+                let captured = backend.capture(&target_for_capture, cursor)?;
+                let mut frame = captured.frame;
+                let origin = backend.origin(&target_for_capture)?;
+                let cursor_method = captured.cursor_method;
+                let cursor_drawn = captured.cursor_drawn;
+                if grid {
+                    let spacing = if frame.width < 500 { 50 } else { 100 };
+                    screenshot::overlay_grid(&mut frame, spacing);
+                }
+                if !mark_boxes.is_empty() {
+                    let (ox, oy) = origin.unwrap_or((0, 0));
+                    screenshot::draw_marks(&mut frame, &mark_boxes, ox, oy);
+                }
+                let source_width = frame.width;
+                let source_height = frame.height;
+                let (width, height) = if native {
+                    (frame.width, frame.height)
+                } else {
+                    screenshot::fit(frame.width, frame.height, max_width, max_height)
+                };
+                let scaled = screenshot::resize(&frame, width, height);
+                let png = screenshot::encode_png(width, height, &scaled)?;
+                Ok((
+                    png,
+                    source_width,
+                    source_height,
+                    width,
+                    height,
+                    origin,
+                    cursor_method,
+                    cursor_drawn,
+                ))
+            })
+            .await
+            .context("screenshot task failed")??;
 
             if marks_requested {
                 session.set_marks(mark_list);
@@ -748,7 +781,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             let metadata = json!({
                 "display": session.info.display,
                 "capture": kind,
-                "window_id": window_id,
+                "window_id": handle.as_ref().map(|handle| handle.to_json()).unwrap_or(Value::Null),
                 "region": origin.map(|(x, y)| json!({
                     "x": x,
                     "y": y,
@@ -765,7 +798,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                 "image_height": height,
                 "scale": if source_width == 0 { 1.0 } else { width as f64 / source_width as f64 },
                 "cursor_overlay": cursor,
-                "cursor_drawn": cursor_method.is_some(),
+                "cursor_drawn": cursor_drawn,
                 "cursor_method": cursor_method.map(|method| format!("{method:?}").to_lowercase()),
                 "grid_overlay": grid,
                 "marks_requested": marks_requested,
@@ -787,7 +820,6 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "click" => {
             let session = active(manager).await?;
-            let tool = xdotool(manager)?;
             let button = button_arg(args)?;
             let count = opt_u64(args, "count").unwrap_or(1).clamp(1, 20) as u32;
             let modifiers = args
@@ -871,6 +903,8 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                     required_i64(args, "y")? as i32,
                 ),
             };
+            session.require_pointer()?;
+            let tool = xdotool(manager)?;
             let mut result = input::click(&session, &tool, x, y, button, count, &modifiers).await?;
             if let Some(mark) = &target {
                 result["mark"] = json!(mark.mark);
@@ -880,6 +914,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "mouse_down" | "mouse_up" => {
             let session = active(manager).await?;
+            session.require_pointer()?;
             let tool = xdotool(manager)?;
             let button = button_arg(args)?;
             let at = match (opt_i64(args, "x"), opt_i64(args, "y")) {
@@ -893,6 +928,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "key_down" | "key_up" => {
             let session = active(manager).await?;
+            session.require_keyboard()?;
             let tool = xdotool(manager)?;
             let combo = required_str(args, "key")?;
             Ok(CallResult::text(
@@ -901,6 +937,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "move" => {
             let session = active(manager).await?;
+            session.require_pointer()?;
             let tool = xdotool(manager)?;
             let x = required_i64(args, "x")? as i32;
             let y = required_i64(args, "y")? as i32;
@@ -910,6 +947,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "drag" => {
             let session = active(manager).await?;
+            session.require_pointer()?;
             let tool = xdotool(manager)?;
             let from = (
                 required_i64(args, "x1")? as i32,
@@ -927,6 +965,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "scroll" => {
             let session = active(manager).await?;
+            session.require_pointer()?;
             let tool = xdotool(manager)?;
             let amount = opt_u64(args, "amount").unwrap_or(3).clamp(1, 100) as u32;
             let direction = opt_str(args, "direction").unwrap_or("down");
@@ -945,6 +984,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "type" => {
             let session = active(manager).await?;
+            session.require_keyboard()?;
             let tool = xdotool(manager)?;
             let text = required_str(args, "text")?;
             let delay = opt_u64(args, "delay_ms").unwrap_or(12).min(1000) as u32;
@@ -954,6 +994,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "key" => {
             let session = active(manager).await?;
+            session.require_keyboard()?;
             let tool = xdotool(manager)?;
             let combo = required_str(args, "combo")?;
             let delay = opt_u64(args, "delay_ms").unwrap_or(12).min(1000) as u32;
@@ -1000,26 +1041,30 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "clipboard_get" => {
             let session = active(manager).await?;
-            let display = session.info.display.clone();
-            let text = tokio::task::spawn_blocking(move || clipboard::get(&display))
+            session.require_clipboard()?;
+            let backend = session.backend();
+            let text = tokio::task::spawn_blocking(move || backend.clipboard_get())
                 .await
                 .context("clipboard read task failed")??;
             Ok(CallResult::text(&json!({
                 "display": session.info.display,
+                "backend": session.backend.kind().as_str(),
                 "text": text,
                 "length": text.chars().count(),
             })))
         }
         "clipboard_set" => {
             let session = active(manager).await?;
+            session.require_clipboard()?;
             let text = required_str(args, "text")?.to_string();
-            let display = session.info.display.clone();
             let length = text.chars().count();
-            tokio::task::spawn_blocking(move || clipboard::set(&display, &text))
+            let backend = session.backend();
+            tokio::task::spawn_blocking(move || backend.clipboard_set(&text))
                 .await
                 .context("clipboard write task failed")??;
             Ok(CallResult::text(&json!({
                 "display": session.info.display,
+                "backend": session.backend.kind().as_str(),
                 "ok": true,
                 "length": length,
                 "note": "Selection ownership is served by a background thread for as long as the MCP server runs.",
@@ -1294,39 +1339,46 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "list_windows" => {
             let session = active(manager).await?;
-            let display = session.info.display.clone();
-            let list = tokio::task::spawn_blocking(move || windows::list(&display))
+            let backend = session.backend();
+            let list = tokio::task::spawn_blocking(move || backend.windows())
                 .await
                 .context("window listing task failed")??;
             let windows: Vec<Value> = list.iter().map(|window| window.to_json()).collect();
             Ok(CallResult::text(&json!({
                 "display": session.info.display,
+                "backend": session.backend.kind().as_str(),
                 "count": windows.len(),
                 "windows": windows,
             })))
         }
         "focus_window" => {
             let session = active(manager).await?;
-            let id = x11::parse_window_id(args.get("id").unwrap_or(&Value::Null))?;
-            let display = session.info.display.clone();
-            let result = tokio::task::spawn_blocking(move || windows::focus(&display, id))
+            let id = backend::parse_window_handle(
+                args.get("id").unwrap_or(&Value::Null),
+                session.backend.kind(),
+            )?;
+            let backend = session.backend();
+            let result = tokio::task::spawn_blocking(move || backend.focus_window(&id))
                 .await
                 .context("focus task failed")??;
             Ok(CallResult::text(&result))
         }
         "move_resize_window" => {
             let session = active(manager).await?;
-            let id = x11::parse_window_id(args.get("id").unwrap_or(&Value::Null))?;
-            let x = clamp_i16(required_i64(args, "x")?)?;
-            let y = clamp_i16(required_i64(args, "y")?)?;
-            let width = clamp_u16(required_i64(args, "width")?)?;
-            let height = clamp_u16(required_i64(args, "height")?)?;
+            let id = backend::parse_window_handle(
+                args.get("id").unwrap_or(&Value::Null),
+                session.backend.kind(),
+            )?;
+            let x = clamp_i16(required_i64(args, "x")?)? as i32;
+            let y = clamp_i16(required_i64(args, "y")?)? as i32;
+            let width = clamp_u16(required_i64(args, "width")?)? as u32;
+            let height = clamp_u16(required_i64(args, "height")?)? as u32;
             if width == 0 || height == 0 {
                 return Err(anyhow!("width and height must be greater than zero"));
             }
-            let display = session.info.display.clone();
+            let backend = session.backend();
             let result = tokio::task::spawn_blocking(move || {
-                windows::move_resize(&display, id, x, y, width, height)
+                backend.move_resize_window(&id, x, y, width, height)
             })
             .await
             .context("move/resize task failed")??;
@@ -1334,45 +1386,49 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "close_window" => {
             let session = active(manager).await?;
-            let id = x11::parse_window_id(args.get("id").unwrap_or(&Value::Null))?;
+            let id = backend::parse_window_handle(
+                args.get("id").unwrap_or(&Value::Null),
+                session.backend.kind(),
+            )?;
             let force = opt_bool(args, "force").unwrap_or(false);
-            let display = session.info.display.clone();
-            let result = tokio::task::spawn_blocking(move || windows::close(&display, id, force))
+            let backend = session.backend();
+            let result = tokio::task::spawn_blocking(move || backend.close_window(&id, force))
                 .await
                 .context("close task failed")??;
             Ok(CallResult::text(&result))
         }
         "window_state" => {
             let session = active(manager).await?;
-            let id = x11::parse_window_id(args.get("id").unwrap_or(&Value::Null))?;
+            let id = backend::parse_window_handle(
+                args.get("id").unwrap_or(&Value::Null),
+                session.backend.kind(),
+            )?;
             let action = required_str(args, "action")?.to_string();
-            let display = session.info.display.clone();
-            let result =
-                tokio::task::spawn_blocking(move || windows::action(&display, id, &action))
-                    .await
-                    .context("window state task failed")??;
+            let backend = session.backend();
+            let result = tokio::task::spawn_blocking(move || backend.window_action(&id, &action))
+                .await
+                .context("window state task failed")??;
             Ok(CallResult::text(&result))
         }
         "resize_display" => {
             let session = active(manager).await?;
             let width = opt_u64(args, "width")
                 .ok_or_else(|| anyhow!("missing width"))?
-                .clamp(64, 8192) as u16;
+                .clamp(64, 8192) as u32;
             let height = opt_u64(args, "height")
                 .ok_or_else(|| anyhow!("missing height"))?
-                .clamp(64, 8192) as u16;
+                .clamp(64, 8192) as u32;
             let refresh = args
                 .get("refresh")
                 .and_then(Value::as_f64)
                 .map(|v| v as f32);
-            let display = session.info.display.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                randr::resize(&display, width, height, refresh)
-            })
-            .await
-            .context("resize task failed")??;
+            let backend = session.backend();
+            let result =
+                tokio::task::spawn_blocking(move || backend.resize_display(width, height, refresh))
+                    .await
+                    .context("resize task failed")??;
             session
-                .set_size(u32::from(width), u32::from(height))
+                .set_size(width, height)
                 .context("display resized but the state file could not be updated")?;
             Ok(CallResult::text(&result))
         }
@@ -1609,6 +1665,7 @@ async fn diagnose(manager: &DisplayManager) -> Value {
     };
     add("Xephyr", &manager.tools.xephyr);
     add("Xvfb", &manager.tools.xvfb);
+    add("sway", &manager.tools.sway);
     add("window_manager", &manager.tools.wm);
     add("xdotool", &manager.tools.xdotool);
     add("python3", &manager.tools.python);
@@ -1622,6 +1679,7 @@ async fn diagnose(manager: &DisplayManager) -> Value {
             vec!["--version"],
         ),
         ("xdotool", manager.tools.xdotool.clone(), vec!["--version"]),
+        ("sway", manager.tools.sway.clone(), vec!["--version"]),
         ("python3", manager.tools.python.clone(), vec!["--version"]),
         ("gdbus", manager.tools.gdbus.clone(), vec!["--version"]),
         (
@@ -1658,10 +1716,25 @@ async fn diagnose(manager: &DisplayManager) -> Value {
 
     let session = manager.session().await;
     let active = session.as_ref().map(|session| {
+        let reachable = match session.info.backend {
+            BackendKind::X11 => x11::connect(&session.info.display).is_ok(),
+            BackendKind::Wayland => session
+                .info
+                .wayland_display
+                .as_ref()
+                .map(|display| session.info.runtime_dir.join(display).exists())
+                .unwrap_or(false),
+        };
         json!({
             "session_id": session.info.session_id,
             "display": session.info.display,
-            "display_reachable": x11::connect(&session.info.display).is_ok(),
+            "backend": session.info.backend.as_str(),
+            "capabilities": session.info.capabilities(),
+            "display_reachable": reachable,
+            "wayland_display": session.info.wayland_display,
+            "swaysock": session.info.swaysock.as_ref().map(|path| path.display().to_string()),
+            "output_name": session.info.output_name,
+            "xwayland_display": session.info.xdisplay,
             "width": session.width(),
             "height": session.height(),
             "visible": session.info.visible,
@@ -1697,7 +1770,7 @@ async fn diagnose(manager: &DisplayManager) -> Value {
         "notes": [
             "Xephyr/Xvfb are found in the bundled runtime tree even when they are absent from the host PATH.",
             "X servers do not implement -version; their path identifies the bundled build.",
-            "The nested desktop is X11-only; the host may be Wayland through XWayland.",
+            "The nested desktop defaults to X11; backend=wayland uses sway with output capture, sway-IPC window control, and display resize. Wayland input and clipboard are not wired yet.",
             "AT-SPI requires PyGObject in the python3 environment (python_atspi).",
             "XEPHYR_MCP_IDLE_TIMEOUT_SECS and XEPHYR_MCP_MAX_LIFETIME_SECS enable the auto-teardown watchdog.",
             "Set persist_home=true to keep app profiles across display_stop/display_start with the same session_id.",

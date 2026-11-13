@@ -1,5 +1,6 @@
 //! EWMH window listing, focus, move/resize and close.
 
+use crate::backend::{BackendKind, WinId};
 use crate::x11;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -14,6 +15,9 @@ use x11rb::rust_connection::RustConnection;
 #[derive(Clone, Debug)]
 pub struct WindowInfo {
     pub id: Window,
+    pub handle: WinId,
+    pub backend: BackendKind,
+    pub app_id: Option<String>,
     pub title: String,
     pub instance: Option<String>,
     pub class: Option<String>,
@@ -25,12 +29,78 @@ pub struct WindowInfo {
     pub mapped: bool,
     pub focused: bool,
     pub desktop: Option<u32>,
+    pub workspace: Option<String>,
     pub frame: Option<(u32, u32, u32, u32)>,
     pub stack: usize,
 }
 
 impl WindowInfo {
+    #[allow(clippy::too_many_arguments)]
+    pub fn wayland(
+        handle: WinId,
+        title: String,
+        app_id: Option<String>,
+        class: Option<String>,
+        instance: Option<String>,
+        pid: Option<u32>,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        focused: bool,
+        visible: bool,
+        workspace: Option<String>,
+        stack: usize,
+    ) -> Self {
+        let clamp_x = x.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let clamp_y = y.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let clamp_w = width.clamp(0, u16::MAX as i32) as u16;
+        let clamp_h = height.clamp(0, u16::MAX as i32) as u16;
+        let desktop = workspace.as_ref().and_then(|name| name.parse::<u32>().ok());
+        Self {
+            id: 0,
+            handle,
+            backend: BackendKind::Wayland,
+            app_id,
+            title,
+            instance,
+            class,
+            pid,
+            x: clamp_x,
+            y: clamp_y,
+            width: clamp_w,
+            height: clamp_h,
+            mapped: visible,
+            focused,
+            desktop,
+            workspace,
+            frame: None,
+            stack,
+        }
+    }
+
     pub fn to_json(&self) -> Value {
+        if self.backend == BackendKind::Wayland {
+            return json!({
+                "id": self.handle.as_str(),
+                "title": self.title,
+                "class": self.class,
+                "instance": self.instance,
+                "app_id": self.app_id,
+                "pid": self.pid,
+                "x": self.x,
+                "y": self.y,
+                "width": self.width,
+                "height": self.height,
+                "mapped": self.mapped,
+                "focused": self.focused,
+                "desktop": self.desktop,
+                "workspace": self.workspace,
+                "frame_extents": Value::Null,
+                "stack": self.stack,
+                "backend": "wayland",
+            });
+        }
         json!({
             "id": self.id,
             "id_hex": format!("0x{:x}", self.id),
@@ -196,6 +266,9 @@ pub fn list(display: &str) -> Result<Vec<WindowInfo>> {
 
         out.push(WindowInfo {
             id,
+            handle: WinId::x11(id),
+            backend: BackendKind::X11,
+            app_id: None,
             title,
             instance,
             class,
@@ -207,6 +280,7 @@ pub fn list(display: &str) -> Result<Vec<WindowInfo>> {
             mapped: attr.map_state == MapState::VIEWABLE,
             focused: active == Some(id),
             desktop,
+            workspace: None,
             frame,
             stack: 0,
         });

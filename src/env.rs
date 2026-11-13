@@ -24,9 +24,16 @@ impl Tool {
 /// A private runtime tree created by `scripts/fetch-runtime.sh`.
 pub fn runtime_root() -> Option<PathBuf> {
     let looks_right = |p: &Path| {
-        ["usr/bin/Xephyr", "bin/Xephyr", "usr/bin/Xvfb", "bin/Xvfb"]
-            .iter()
-            .any(|rel| is_executable(&p.join(rel)))
+        [
+            "usr/bin/Xephyr",
+            "bin/Xephyr",
+            "usr/bin/Xvfb",
+            "bin/Xvfb",
+            "usr/bin/sway",
+            "bin/sway",
+        ]
+        .iter()
+        .any(|rel| is_executable(&p.join(rel)))
     };
 
     if let Some(value) = env::var_os("XEPHYR_MCP_RUNTIME") {

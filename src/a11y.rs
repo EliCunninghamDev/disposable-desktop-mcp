@@ -191,6 +191,7 @@ pub async fn click(
         let h = node.get("height").and_then(Value::as_i64);
         if let (Some(x), Some(y), Some(w), Some(h)) = (x, y, w, h) {
             if w > 0 && h > 0 {
+                session.require_pointer()?;
                 let tool = xdotool.ok_or_else(|| {
                     anyhow!("xdotool is required to click an accessible without an action")
                 })?;

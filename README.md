@@ -91,12 +91,36 @@ agents: it sends `SIGTERM` to every launched process group, waits briefly, then
 
 ## Wayland backend
 
-The Wayland backend is designed but not wired into the server yet. The plan,
-protocol mapping, capability model, and the parts sway does not support as
-expected are in [docs/wayland-backend.md](docs/wayland-backend.md). X11 remains
-the default and the tool catalog is unchanged until that work lands.
+`backend="wayland"` starts sway in the private runtime directory. `visible=false`
+is a headless compositor (the Xvfb analog); `visible=true` opens a nested window
+on the host Wayland session, or on the host X11 session via `WLR_BACKENDS=x11`
+(the Xephyr analog). X11 remains the default.
 
-To prepare a test compositor without root:
+Implemented on this backend:
+
+- sway lifecycle, socket discovery, private D-Bus and AT-SPI, clean
+  `display_stop` via the sway IPC `exit` command plus the process-group sweep;
+- output capture through `wlr-screencopy-v1` into `wl_shm`, with the existing
+  crop/resize/PNG and cursor/grid/marks overlays;
+- `list_windows`, `focus_window`, `close_window`, and `window_state` through
+  sway IPC; geometry is exact for the compositor rect;
+- `move_resize_window` for floating windows, with separate resize/move commands
+  and confirmation polling. Tiled windows return an explicit error instead of
+  silently reflowing the desktop;
+- `resize_display` through `output <name> mode`;
+- optional `xwayland=true` for X11-only apps.
+
+Pointer/keyboard injection and the data-control clipboard are the next phase, so
+this build reports `pointer: false`, `keyboard: false`, and `clipboard: "none"`
+for Wayland sessions and the input/clipboard tools return a capability error.
+The viewer is still X11-only. The protocol map, spike results, and acceptance
+tests are in [docs/wayland-backend.md](docs/wayland-backend.md).
+
+```json
+{ "backend": "wayland", "visible": false, "width": 1024, "height": 768 }
+```
+
+To prepare the compositor without root:
 
 ```sh
 ./scripts/fetch-runtime.sh --wayland
