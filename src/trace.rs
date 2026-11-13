@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn traces_dir() -> PathBuf {
     env::shared_runtime_dir().join("traces")
@@ -188,6 +189,80 @@ fn newest_trace() -> Option<PathBuf> {
         }
     }
     best.map(|(_, path)| path)
+}
+
+/// Per-call trace screenshots are opt-in: each screen-changing call would
+/// otherwise pay for two full captures plus PNG encoding.
+pub fn screenshots_enabled() -> bool {
+    match std::env::var("XEPHYR_MCP_TRACE_SCREENSHOTS") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Keep the newest N step images per session so a long run cannot fill the
+/// runtime filesystem.
+pub const MAX_STEPS: usize = 400;
+
+fn safe_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub fn steps_dir(session_id: Option<&str>) -> PathBuf {
+    let name = match session_id {
+        Some(id) if !id.is_empty() => safe_component(id),
+        _ => format!("server-{}", std::process::id()),
+    };
+    traces_dir().join("steps").join(name)
+}
+
+/// Write one before/after frame and prune older images.  Returns the path so
+/// it can be recorded in the trace entry.
+pub fn write_step(dir: &Path, tool: &str, phase: &str, png: &[u8]) -> Result<PathBuf> {
+    env::create_private_dir(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!(
+        "{stamp:013}-{}-{}.png",
+        safe_component(tool),
+        safe_component(phase)
+    ));
+    std::fs::write(&path, png).with_context(|| format!("cannot write {}", path.display()))?;
+    prune_steps(dir, MAX_STEPS);
+    Ok(path)
+}
+
+fn prune_steps(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut images: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("png"))
+        .collect();
+    if images.len() <= keep {
+        return;
+    }
+    images.sort();
+    let excess = images.len() - keep;
+    for path in images.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(test)]

@@ -369,10 +369,12 @@ pub async fn marks(
     Ok((value, marks))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn set_text(
     session: &Session,
     python: Option<&Tool>,
-    name: &str,
+    name: Option<&str>,
+    path: Option<&str>,
     role: Option<&str>,
     index: u32,
     text: &str,
@@ -381,12 +383,18 @@ pub async fn set_text(
         python.ok_or_else(|| anyhow!("python3 with PyGObject is required for a11y_set_text"))?;
     let mut args = vec![
         "set_text".to_string(),
-        "--name".to_string(),
-        name.to_string(),
         "--index".to_string(),
         index.to_string(),
         format!("--text={text}"),
     ];
+    if let Some(path) = path {
+        args.push("--path".into());
+        args.push(path.to_string());
+    }
+    if let Some(name) = name {
+        args.push("--name".into());
+        args.push(name.to_string());
+    }
     if let Some(role) = role {
         args.push("--role".into());
         args.push(role.to_string());
@@ -403,6 +411,7 @@ pub async fn focus(
     session: &Session,
     python: Option<&Tool>,
     name: Option<&str>,
+    path: Option<&str>,
     role: Option<&str>,
     index: u32,
 ) -> Result<Value> {
@@ -413,6 +422,10 @@ pub async fn focus(
         "--index".to_string(),
         index.to_string(),
     ];
+    if let Some(path) = path {
+        args.push("--path".into());
+        args.push(path.to_string());
+    }
     if let Some(name) = name {
         args.push("--name".into());
         args.push(name.to_string());

@@ -179,6 +179,15 @@ pub struct Launched {
     pub started_at: Instant,
 }
 
+/// Recorded exit status for a launched child.  A background task reaps each
+/// child, so the status stays queryable after `launch` has returned.
+#[derive(Clone, Debug)]
+pub struct ExitInfo {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub after_ms: u64,
+}
+
 pub struct Session {
     pub info: SessionInfo,
     pub launched: Mutex<Vec<Launched>>,
@@ -186,6 +195,8 @@ pub struct Session {
     size: Mutex<(u32, u32)>,
     /// Numbered elements from the most recent set-of-marks screenshot.
     marks: Mutex<Vec<crate::a11y::Mark>>,
+    /// Exit statuses keyed by launch pid.
+    exits: Mutex<std::collections::HashMap<u32, ExitInfo>>,
     launch_seq: AtomicU64,
 }
 
@@ -282,6 +293,37 @@ impl Session {
         if let Ok(mut list) = self.launched.lock() {
             list.push(launched);
         }
+    }
+
+    /// Store the status of a reaped child.  Later calls to `launch_status`
+    /// read this instead of waiting on the process again.
+    pub fn record_exit(&self, pid: u32, code: Option<i32>, signal: Option<i32>, after_ms: u64) {
+        if let Ok(mut exits) = self.exits.lock() {
+            exits.insert(
+                pid,
+                ExitInfo {
+                    code,
+                    signal,
+                    after_ms,
+                },
+            );
+        }
+    }
+
+    pub fn exit_info(&self, pid: u32) -> Option<ExitInfo> {
+        self.exits.lock().ok()?.get(&pid).cloned()
+    }
+
+    /// True while a launch is alive and its exit status has not been reaped.
+    pub fn running(&self, pid: u32) -> bool {
+        self.exit_info(pid).is_none() && crate::proc::alive(pid)
+    }
+
+    pub fn launched(&self) -> Vec<Launched> {
+        self.launched
+            .lock()
+            .map(|list| list.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -495,6 +537,7 @@ impl DisplayManager {
                         launched: Mutex::new(Vec::new()),
                         size: Mutex::new((info.width, info.height)),
                         marks: Mutex::new(Vec::new()),
+                        exits: Mutex::new(std::collections::HashMap::new()),
                         launch_seq: AtomicU64::new(0),
                     });
                     *guard = Some(session);

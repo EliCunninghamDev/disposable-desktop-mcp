@@ -307,6 +307,18 @@ def resolve_target(desktop, record):
     return target
 
 
+def target_by_path(desktop, path):
+    """Resolve a tree path to (record, live target)."""
+    target = resolve_target(desktop, {"path": path})
+    if target is None:
+        return None, None
+    app_index = int(path.split(".")[0])
+    app = safe(lambda: desktop.get_child_at_index(app_index))
+    app_name = text(safe(lambda: app.get_name(), "")) if app is not None else ""
+    record = node_record(target, path, app_name, len(path.split(".")) - 1)
+    return record, target
+
+
 def state_filter(record, wanted):
     """Match a comma-separated list of required boolean states."""
     if not wanted:
@@ -655,24 +667,37 @@ def main():
         })
 
     if command == "set_text":
+        path = (options.get("path") or "").strip()
         wanted = (options.get("name") or "").strip()
         role_filter = (options.get("role") or "").strip().lower()
-        if not wanted:
-            fail("set_text needs --name")
-        chosen, app_count = collect_matches(desktop, options, wanted, role_filter)
-        if not chosen:
-            emit({
-                "ok": True,
-                "found": False,
-                "changed": False,
-                "query": wanted,
-                "apps": app_count,
-                "error": f"no accessible named {wanted!r}",
-            })
-        index = int(options.get("index", 0) or 0)
-        index = max(0, min(index, len(chosen) - 1))
-        record = chosen[index][1]
-        target = resolve_target(desktop, record)
+        app_count = 0
+        if path:
+            record, target = target_by_path(desktop, path)
+            if record is None:
+                emit({
+                    "ok": True,
+                    "found": False,
+                    "changed": False,
+                    "path": path,
+                    "error": "the accessibility node no longer exists",
+                })
+        else:
+            if not wanted:
+                fail("set_text needs --name or --path")
+            chosen, app_count = collect_matches(desktop, options, wanted, role_filter)
+            if not chosen:
+                emit({
+                    "ok": True,
+                    "found": False,
+                    "changed": False,
+                    "query": wanted,
+                    "apps": app_count,
+                    "error": f"no accessible named {wanted!r}",
+                })
+            index = int(options.get("index", 0) or 0)
+            index = max(0, min(index, len(chosen) - 1))
+            record = chosen[index][1]
+            target = resolve_target(desktop, record)
         value = options.get("text", "")
         editable = bool(safe(lambda: target.is_editable_text(), False)) if target else False
         focused = bool(record.get("focused"))
@@ -686,28 +711,44 @@ def main():
             "editable": editable,
             "focused": focused,
             "text": value,
+            "path": path or record.get("path"),
+            "query": wanted or None,
+            "apps": app_count,
             "node": record,
         })
 
     if command == "focus":
+        path = (options.get("path") or "").strip()
         wanted = (options.get("name") or "").strip()
         role_filter = (options.get("role") or "").strip().lower()
-        if not wanted and not role_filter:
-            fail("focus needs --name or --role")
-        chosen, app_count = collect_matches(desktop, options, wanted, role_filter)
-        if not chosen:
-            emit({
-                "ok": True,
-                "found": False,
-                "focused": False,
-                "query": wanted,
-                "apps": app_count,
-                "error": f"no accessible named {wanted!r}",
-            })
-        index = int(options.get("index", 0) or 0)
-        index = max(0, min(index, len(chosen) - 1))
-        record = chosen[index][1]
-        target = resolve_target(desktop, record)
+        app_count = 0
+        if path:
+            record, target = target_by_path(desktop, path)
+            if record is None:
+                emit({
+                    "ok": True,
+                    "found": False,
+                    "focused": False,
+                    "path": path,
+                    "error": "the accessibility node no longer exists",
+                })
+        else:
+            if not wanted and not role_filter:
+                fail("focus needs --name, --role, or --path")
+            chosen, app_count = collect_matches(desktop, options, wanted, role_filter)
+            if not chosen:
+                emit({
+                    "ok": True,
+                    "found": False,
+                    "focused": False,
+                    "query": wanted,
+                    "apps": app_count,
+                    "error": f"no accessible named {wanted!r}",
+                })
+            index = int(options.get("index", 0) or 0)
+            index = max(0, min(index, len(chosen) - 1))
+            record = chosen[index][1]
+            target = resolve_target(desktop, record)
         focused = bool(record.get("focused"))
         if not focused and target is not None:
             focused = bool(safe(lambda: target.grab_focus(), False))
@@ -722,6 +763,9 @@ def main():
             "ok": True,
             "found": True,
             "focused": focused,
+            "path": path or record.get("path"),
+            "query": wanted or None,
+            "apps": app_count,
             "node": record,
         })
 

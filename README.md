@@ -182,6 +182,15 @@ Every tool call is appended to
 `$XDG_RUNTIME_DIR/xephyr-mcp/traces/<session_id>.jsonl` with the sanitized
 arguments, duration, outcome, and before/after frame hashes for screen-changing
 tools. Traces survive `display_stop`; read them with `trace_tail`. Set
+Launch handles stay queryable: `launch` records every child and a background
+reaper stores its exit status, so `launch_status` can report `running`,
+`exit_code`, the terminating signal, and uptime long after launch returned.
+
+Set `XEPHYR_MCP_TRACE_SCREENSHOTS=1` to also save the before/after frame of each
+screen-changing call under `traces/steps/<session>/`. The trace entry then
+carries `before_shot` and `after_shot` paths; the newest 400 images per session
+are kept.
+
 `persist_home=true` on `display_start` to keep `HOME` and XDG directories under
 `$XDG_RUNTIME_DIR/xephyr-mcp/homes/<session_id>` across restarts with the same
 session id. Set `XEPHYR_MCP_IDLE_TIMEOUT_SECS` or

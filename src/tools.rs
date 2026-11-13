@@ -56,6 +56,17 @@ pub fn definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "launch_status",
+            "Report the current state of processes started with launch in this session: running, exit_code, terminating signal, uptime, and log path. With pid, report just that launch; with include_exited=false, omit finished ones. Exit status is captured by a background reaper, so it remains available after launch returns.",
+            schema(
+                json!({
+                    "pid": { "type": "integer", "minimum": 1, "description": "Only report this pid (must have been started by launch)" },
+                    "include_exited": { "type": "boolean", "description": "Include launches that have finished (default true)" }
+                }),
+                &[],
+            ),
+        ),
+        tool(
             "screenshot",
             "Capture the nested desktop as a PNG. Without options this captures the full root window downscaled to max_width/max_height; set region or window_id to crop at native resolution, and cursor/grid/marks to overlay the pointer, a 100 px grid, or numbered accessibility targets. Marks also records the mapping so click(mark=N) can target an element. The text block reports display/image dimensions, crop origin, scale, and the mark list.",
             schema(
@@ -396,23 +407,25 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "a11y_set_text",
-            "Set the text of an editable accessible field by name using the AT-SPI EditableText interface. Avoids focus and per-character typing, and works for long or Unicode input. Returns changed/editable and the matched node.",
+            "Set the text of an editable accessible field by name or tree path using the AT-SPI EditableText interface. Path targeting is reliable for GTK4 widgets. Avoids focus and per-character typing, and works for long or Unicode input. Returns changed/editable and the matched node.",
             schema(
                 json!({
                     "name": { "type": "string", "description": "Accessible name or label of the field" },
+                    "path": { "type": "string", "description": "Tree path from a11y_tree/a11y_find; bypasses name matching and geometry" },
                     "text": { "type": "string", "description": "New field contents" },
                     "role": { "type": "string", "description": "Optional role filter, e.g. 'entry'" },
                     "index": { "type": "integer", "minimum": 0, "maximum": 200, "description": "Pick the Nth best match (default 0)" }
                 }),
-                &["name", "text"],
+                &["text"],
             ),
         ),
         tool(
             "a11y_focus",
-            "Give keyboard focus to an accessible element by name or role. Use before key/type when clicking should not change selection or activate the control.",
+            "Give keyboard focus to an accessible element by name, role, or tree path. Path targeting is reliable for GTK4 widgets. Use before key/type when clicking should not change selection or activate the control.",
             schema(
                 json!({
                     "name": { "type": "string", "description": "Accessible name substring" },
+                    "path": { "type": "string", "description": "Tree path from a11y_tree/a11y_find; bypasses name matching and geometry" },
                     "role": { "type": "string", "description": "Role filter, e.g. 'entry', 'text'" },
                     "index": { "type": "integer", "minimum": 0, "maximum": 200, "description": "Pick the Nth best match (default 0)" }
                 }),
@@ -475,16 +488,17 @@ pub async fn call(manager: &DisplayManager, name: &str, args: &Value) -> CallRes
     let started = std::time::Instant::now();
     let before_session = manager.session().await;
     let hashed = trace::should_hash(name);
-    let before_hash = if hashed {
-        frame_hash(before_session.as_ref()).await
+    let with_png = hashed && trace::screenshots_enabled();
+    let before = if hashed {
+        capture_state(before_session.as_ref(), with_png).await
     } else {
         None
     };
 
     let outcome = dispatch(manager, name, args).await;
     let after_session = manager.session().await;
-    let after_hash = if hashed {
-        frame_hash(after_session.as_ref()).await
+    let after = if hashed {
+        capture_state(after_session.as_ref(), with_png).await
     } else {
         None
     };
@@ -501,7 +515,7 @@ pub async fn call(manager: &DisplayManager, name: &str, args: &Value) -> CallRes
     let error = result
         .is_error
         .then(|| result.summary().unwrap_or("tool error"));
-    let entry = trace::entry(
+    let mut entry = trace::entry(
         name,
         args,
         session_id,
@@ -509,25 +523,54 @@ pub async fn call(manager: &DisplayManager, name: &str, args: &Value) -> CallRes
         started.elapsed().as_millis(),
         !result.is_error,
         error,
-        before_hash.as_deref(),
-        after_hash.as_deref(),
+        before.as_ref().map(|capture| capture.hash.as_str()),
+        after.as_ref().map(|capture| capture.hash.as_str()),
     );
+    if with_png {
+        let dir = trace::steps_dir(session_id);
+        attach_step(&mut entry, &dir, name, "before", before.as_ref());
+        attach_step(&mut entry, &dir, name, "after", after.as_ref());
+    }
     let _ = trace::append(&trace::path_for(session_id), entry);
 
     manager.end_call();
     result
 }
 
-async fn frame_hash(session: Option<&Arc<Session>>) -> Option<String> {
+struct Capture {
+    hash: String,
+    png: Option<Vec<u8>>,
+}
+
+async fn capture_state(session: Option<&Arc<Session>>, with_png: bool) -> Option<Capture> {
     let display = session?.info.display.clone();
     tokio::task::spawn_blocking(move || {
-        screenshot::capture(&display)
-            .map(|frame| format!("{:016x}", screenshot::hash(&frame)))
-            .ok()
+        screenshot::capture(&display).ok().map(|frame| {
+            let hash = format!("{:016x}", screenshot::hash(&frame));
+            let png = with_png
+                .then(|| screenshot::encode_png(frame.width, frame.height, &frame.rgba).ok())
+                .flatten();
+            Capture { hash, png }
+        })
     })
     .await
     .ok()
     .flatten()
+}
+
+fn attach_step(
+    entry: &mut Value,
+    dir: &std::path::Path,
+    tool: &str,
+    phase: &str,
+    capture: Option<&Capture>,
+) {
+    let Some(png) = capture.and_then(|capture| capture.png.as_ref()) else {
+        return;
+    };
+    if let Ok(path) = trace::write_step(dir, tool, phase, png) {
+        entry[format!("{phase}_shot")] = json!(path.display().to_string());
+    }
 }
 
 async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<CallResult> {
@@ -553,6 +596,45 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             let wait_ms = opt_u64(args, "wait_ms").unwrap_or(250);
             let result = launch_process(&session, command, wait_ms).await?;
             Ok(CallResult::text(&result))
+        }
+        "launch_status" => {
+            let session = active(manager).await?;
+            let wanted = opt_u64(args, "pid").map(|value| value as u32);
+            let include_exited = opt_bool(args, "include_exited").unwrap_or(true);
+            let launches = session.launched();
+            if let Some(pid) = wanted {
+                if !launches.iter().any(|item| item.pid == pid) {
+                    return Err(anyhow!(
+                        "pid {pid} was not started by launch in this session; use list_processes for other processes"
+                    ));
+                }
+            }
+            let mut items: Vec<Value> = Vec::new();
+            for item in launches {
+                if wanted.map(|pid| pid != item.pid).unwrap_or(false) {
+                    continue;
+                }
+                let exit = session.exit_info(item.pid);
+                let running = exit.is_none() && session.running(item.pid);
+                if !include_exited && !running {
+                    continue;
+                }
+                items.push(json!({
+                    "pid": item.pid,
+                    "command": item.command,
+                    "log": item.log.display().to_string(),
+                    "running": running,
+                    "exit_code": exit.as_ref().and_then(|info| info.code),
+                    "signal": exit.as_ref().and_then(|info| info.signal),
+                    "exit_after_ms": exit.as_ref().map(|info| info.after_ms),
+                    "uptime_ms": item.started_at.elapsed().as_millis() as u64,
+                }));
+            }
+            Ok(CallResult::text(&json!({
+                "display": session.info.display,
+                "count": items.len(),
+                "launches": items,
+            })))
         }
         "screenshot" => {
             let session = active(manager).await?;
@@ -757,6 +839,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                                 &session,
                                 Some(python),
                                 Some(&mark.name),
+                                None,
                                 Some(&mark.role),
                                 0,
                             )
@@ -1090,12 +1173,17 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "a11y_set_text" => {
             let session = active(manager).await?;
-            let name = required_str(args, "name")?;
+            let name = opt_str(args, "name");
+            let path = opt_str(args, "path");
+            if name.is_none() && path.is_none() {
+                return Err(anyhow!("a11y_set_text needs 'name' or 'path'"));
+            }
             let text = required_str(args, "text")?;
             let result = a11y::set_text(
                 &session,
                 manager.tools.python.as_ref(),
                 name,
+                path,
                 opt_str(args, "role"),
                 opt_u64(args, "index").unwrap_or(0) as u32,
                 text,
@@ -1106,14 +1194,16 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         "a11y_focus" => {
             let session = active(manager).await?;
             let name = opt_str(args, "name");
+            let path = opt_str(args, "path");
             let role = opt_str(args, "role");
-            if name.is_none() && role.is_none() {
-                return Err(anyhow!("a11y_focus needs 'name' or 'role'"));
+            if name.is_none() && path.is_none() && role.is_none() {
+                return Err(anyhow!("a11y_focus needs 'name', 'path', or 'role'"));
             }
             let result = a11y::focus(
                 &session,
                 manager.tools.python.as_ref(),
                 name,
+                path,
                 role,
                 opt_u64(args, "index").unwrap_or(0) as u32,
             )
@@ -1287,7 +1377,7 @@ fn xdotool(manager: &DisplayManager) -> Result<crate::env::Tool> {
         .ok_or_else(|| anyhow!("xdotool was not found; install it to use input tools"))
 }
 
-async fn launch_process(session: &Session, command: &str, wait_ms: u64) -> Result<Value> {
+async fn launch_process(session: &Arc<Session>, command: &str, wait_ms: u64) -> Result<Value> {
     let command = command.trim();
     if command.is_empty() {
         return Err(anyhow!("command must not be empty"));
@@ -1318,13 +1408,44 @@ async fn launch_process(session: &Session, command: &str, wait_ms: u64) -> Resul
         .spawn()
         .with_context(|| format!("cannot launch {command:?} on {}", session.info.display))?;
     let pid = child.id().unwrap_or(0);
+    let started_at = std::time::Instant::now();
 
     tokio::time::sleep(Duration::from_millis(wait_ms.min(10_000))).await;
     let status = child.try_wait().context("cannot poll launched process")?;
 
+    session.record(crate::display::Launched {
+        pid,
+        command: command.to_string(),
+        log: log.clone(),
+        started_at,
+    });
+
     let (running, exit_code, output_tail) = match status {
-        None => (true, None, None),
+        None => {
+            // Reap in the background so `launch_status` can report the exit
+            // status long after this call has returned.
+            let session = session.clone();
+            tokio::spawn(async move {
+                if let Ok(status) = child.wait().await {
+                    use std::os::unix::process::ExitStatusExt;
+                    session.record_exit(
+                        pid,
+                        status.code(),
+                        status.signal(),
+                        started_at.elapsed().as_millis() as u64,
+                    );
+                }
+            });
+            (true, None, None)
+        }
         Some(status) => {
+            use std::os::unix::process::ExitStatusExt;
+            session.record_exit(
+                pid,
+                status.code(),
+                status.signal(),
+                started_at.elapsed().as_millis() as u64,
+            );
             let tail = crate::proc::tail(&log, 8);
             (
                 false,
@@ -1334,15 +1455,6 @@ async fn launch_process(session: &Session, command: &str, wait_ms: u64) -> Resul
         }
     };
 
-    if running {
-        session.record(crate::display::Launched {
-            pid,
-            command: command.to_string(),
-            log: log.clone(),
-            started_at: std::time::Instant::now(),
-        });
-    }
-
     Ok(json!({
         "display": session.info.display,
         "pid": pid,
@@ -1351,6 +1463,7 @@ async fn launch_process(session: &Session, command: &str, wait_ms: u64) -> Resul
         "exit_code": exit_code,
         "log": log.display().to_string(),
         "output_tail": output_tail,
+        "status_tool": "launch_status",
     }))
 }
 
@@ -1494,6 +1607,7 @@ async fn diagnose(manager: &DisplayManager) -> Value {
             .map(|path| path.display().to_string()),
         "state_dir": crate::env::shared_runtime_dir().display().to_string(),
         "trace_dir": trace::traces_dir().display().to_string(),
+        "trace_screenshots": trace::screenshots_enabled(),
         "homes_dir": crate::env::shared_runtime_dir().join("homes").display().to_string(),
         "idle_timeout_secs": manager.idle_timeout.map(|value| value.as_secs()),
         "max_lifetime_secs": manager.max_lifetime.map(|value| value.as_secs()),
@@ -1509,6 +1623,7 @@ async fn diagnose(manager: &DisplayManager) -> Value {
             "AT-SPI requires PyGObject in the python3 environment (python_atspi).",
             "XEPHYR_MCP_IDLE_TIMEOUT_SECS and XEPHYR_MCP_MAX_LIFETIME_SECS enable the auto-teardown watchdog.",
             "Set persist_home=true to keep app profiles across display_stop/display_start with the same session_id.",
+            "Set XEPHYR_MCP_TRACE_SCREENSHOTS=1 to save before/after PNGs next to the JSONL trace (newest 400 kept per session).",
         ],
     })
 }
