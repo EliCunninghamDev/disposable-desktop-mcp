@@ -49,149 +49,31 @@ and the host session bus are never used.
 - **Runtime control.** XRandR resizing on Xephyr, EWMH window state changes,
   held mouse/key input, persistent per-session HOME, and an auto-teardown
   watchdog.
-- **Trace and marks.** Every tool call is appended to a JSONL trace with
-  before/after frame hashes, and screenshots can draw numbered accessibility
-  targets for reliable `click(mark=N)` routing.
-- **Live viewer.** A GTK4 window with a native session dropdown, Single/BSP
-  layout buttons, aspect-ratio locking, and double-buffered painting.
-- **Cleanup.** Child process groups, the bus daemons, and the display are
-  terminated on `display_stop` or server exit. Stale state is recovered after a
-  crash (`SIGKILL`) on the next start.
-
-## Requirements
-
-- Linux with X11 or XWayland (the viewer needs a host display).
-- Rust 1.88+ (the MCP layer uses the official `rmcp` SDK).
-- GTK 4 development files for building the viewer (`gtk4.pc`; package names
-  vary: `gtk4`, `libgtk-4-dev`, `gtk4-devel`).
-- `xdotool` for input.
-- Optional: `python3` with PyGObject (`python-gobject` / `python3-gi`) for the
-  AT-SPI tools.
-
-The nested X servers, openbox, and their libraries are fetched at runtime, so
-the host does not need Xephyr or Xvfb installed.
-
-## Build
-
-```sh
-./scripts/fetch-runtime.sh   # extracts Xephyr/Xvfb/openbox into ./.runtime
-cargo build --release
-```
-
-`XEPHYR_MCP_RUNTIME` can point at an existing runtime tree instead of
-`./.runtime`.
-
-## MCP configuration
-
-Add the server to your MCP client. For OpenCode:
-
-```json
-{
-  "mcp": {
-    "servers": {
-      "xephyr-mcp": {
-        "type": "local",
-        "command": ["/home/eli/code/xephyr-mcp/target/release/xephyr-mcp"]
-      }
-    }
-  }
-}
-```
-
-The server speaks MCP over stdio using the official
-[`rmcp`](https://crates.io/crates/rmcp) Rust SDK, which handles framing,
-protocol-version negotiation, cancellation, and the typed MCP model. Tool
-definitions and handlers are in `src/tools.rs`; `src/mcp.rs` is the adapter.
-
-## Tools
-
-| Tool | Purpose |
-| --- | --- |
-| `display_start` | Start the nested desktop. Parameters: `width`, `height`, `visible` (Xephyr vs Xvfb), `session_id`, `persist_home`. |
-| `display_stop` | Stop the display and every child process it owns. |
-| `launch` | Run a shell command inside the nested display (`command`, `wait_ms`). |
-| `screenshot` | Capture PNG (`max_width`, `max_height`, `region`, `window_id`, `cursor`, `grid`, `marks`, `mark_limit`, `native`). |
-| `wait_for` | Block on `window`, `process_exit`, `screen_stable`, `region_change`, or `file_exists`. |
-| `wait_for_idle` | Block until the screen (or a region) stops changing. |
-| `click` | Click at display coordinates or a screenshot mark (`x`, `y`, `mark`, `button`, `count`, `modifiers`). |
-| `mouse_down` / `mouse_up` | Hold or release a mouse button (optional `x`/`y`). |
-| `key_down` / `key_up` | Hold or release a key or modifier. |
-| `move` | Move the nested pointer. |
-| `drag` | Drag from `x1,y1` to `x2,y2` (`button`, `duration_ms`). |
-| `scroll` | Wheel scroll (`direction`, `amount`, optional `x`,`y`). |
-| `type` | Type text (`text`, `delay_ms`). |
-| `key` | Send an xdotool key combo (`combo`), e.g. `ctrl+l`. |
-| `clipboard_get` | Read the nested CLIPBOARD selection as text. |
-| `clipboard_set` | Put text on the nested CLIPBOARD selection. |
-| `list_windows` | List EWMH windows with geometry, class, title, pid, and stacking. |
-| `focus_window` | Activate a window by `id`. |
-| `move_resize_window` | Move/resize a window (`id`, `x`, `y`, `width`, `height`). |
-| `close_window` | Ask a window to close (`id`, `force`). |
-| `window_state` | Minimize, maximize, restore, fullscreen, raise/lower, always-on-top, or query state (`id`, `action`). |
-| `resize_display` | Resize the nested desktop with RandR (`width`, `height`, optional `refresh`). |
-| `trace_tail` | Read the JSONL tool trace (`session_id`, `lines`). |
-| `list_processes` | List processes owned by the session (pid, ppid, pgid, command). |
-| `kill_process` | Signal a session-owned process (`pid`, `signal`, `group`). |
-| `tail_log` | Read the tail of a launch or session log (`file`, `lines`). |
-| `a11y_tree` | Dump the AT-SPI tree, or one subtree with `path` (`max_depth`, `max_nodes`, `app`). |
-| `a11y_find` | Query accessible nodes by `name`, `role`, `state`, `action`, and `path` without dumping the tree. |
-| `a11y_click` | Activate an accessible by `name` or `path`, optional `role`/`index`. |
-| `a11y_set_text` | Set an editable field's contents via the EditableText interface. |
-| `a11y_focus` | Give keyboard focus to an accessible element. |
-| `diagnose` | Report dependency paths/versions, host display, and active sessions. |
-
-Coordinates are always in the nested display's pixel space.
-
-Screenshots report `source_width`/`source_height`, `image_width`/`image_height`,
-`origin_x`/`origin_y`, and `scale`. To convert a pixel measured on the returned
-image back to display coordinates: `display = image / scale + origin`. Crops
-(`region`, `window_id`) default to native resolution so small text stays legible.
-
-`wait_for` and `wait_for_idle` replace screenshot polling:
-
-```json
-{"condition": "window", "title": "Save As", "timeout_ms": 5000}
-{"condition": "process_exit", "pid": 12345}
-{"condition": "region_change", "region": {"x": 0, "y": 0, "width": 400, "height": 300}}
-{"condition": "screen_stable", "stable_ms": 400, "region": {"x": 0, "y": 0, "width": 900, "height": 600}}
-{"condition": "file_exists", "path": "/tmp/export.csv"}
-```
-
-A timeout is returned as a successful result with `"timed_out": true` and
-`"satisfied": false`, so an agent can inspect state or retry. Settling on a
-region avoids waiting forever on clocks and animated backgrounds.
-
-## Phase 2 controls
-
-`click` accepts `count` for double/triple clicks and `modifiers` (for example
-`["ctrl","shift"]`) held for the click. `mouse_down`/`mouse_up` and
-`key_down`/`key_up` keep state across calls for drag-selection and games.
-`window_state` applies EWMH state changes; `resize_display` switches Xephyr to
-one of its built-in modes (Xvfb only offers its startup size and returns a clear
-error).
-
-With `screenshot marks=true`, actionable accessibility elements are numbered
-and their centers are recorded. `click mark=N` targets that element; when it has
-an accessibility action (buttons, menu items, check boxes), the action is
-invoked directly, so it does not depend on pixel geometry. GTK4 still reports
-unreliable child coordinates, so the drawn boxes are approximate there, but the
-mark mapping and action routing are reliable. Use `a11y_click path=...` for the
-same reason.
-
-Every tool call is appended to
+- **Trace and marks.** Every tool call is appended to
 `$XDG_RUNTIME_DIR/xephyr-mcp/traces/<session_id>.jsonl` with the sanitized
 arguments, duration, outcome, and before/after frame hashes for screen-changing
-tools. Traces survive `display_stop`; read them with `trace_tail`. Set
-Launch handles stay queryable: `launch` records every child and a background
-reaper stores its exit status, so `launch_status` can report `running`,
-`exit_code`, the terminating signal, and uptime long after launch returned.
+tools. Traces survive `display_stop`; read them with `trace_tail`.
 
 Set `XEPHYR_MCP_TRACE_SCREENSHOTS=1` to also save the before/after frame of each
 screen-changing call under `traces/steps/<session>/`. The trace entry then
 carries `before_shot` and `after_shot` paths; the newest 400 images per session
 are kept.
 
-`persist_home=true` on `display_start` to keep `HOME` and XDG directories under
+## Process lifetime
+
+`launch` starts each command in a detached process group. The process keeps
+running after the call returns, after its window closes, and after it has
+written whatever file it was asked to produce. `launch` returning
+`running: true` means the process is still alive; it is not a background job
+that the server reaps on the next call. Use `launch_status` to check,
+`kill_process all=true` to stop everything you started, and `display_stop` to
+tear down the whole desktop.
+
+Launch handles stay queryable: `launch` records every child and a background
+reaper stores its exit status, so `launch_status` can report `running`,
+`exit_code`, the terminating signal, and uptime long after launch returned.
+
+`persist_home=true` on `display_start` keeps `HOME` and XDG directories under
 `$XDG_RUNTIME_DIR/xephyr-mcp/homes/<session_id>` across restarts with the same
 session id. Set `XEPHYR_MCP_IDLE_TIMEOUT_SECS` or
 `XEPHYR_MCP_MAX_LIFETIME_SECS` to enable the watchdog, which tears down a
@@ -203,7 +85,9 @@ selection transfer is limited to 1 MiB per set.
 
 `list_processes` matches processes by their private `XDG_RUNTIME_DIR`, and
 `kill_process` refuses PIDs that do not belong to the session, so it cannot
-signal host processes. `tail_log` only reads inside the session log directory.
+signal host processes. `kill_process all=true` is the one-call cleanup for
+agents: it sends `SIGTERM` to every launched process group, waits briefly, then
+`SIGKILL`s whatever is left. `tail_log` only reads inside the session log directory.
 
 ## Viewer
 

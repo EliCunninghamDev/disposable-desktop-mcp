@@ -46,7 +46,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "launch",
-            "Launch an application or shell command inside the nested display. The binary comes from the host filesystem, but DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR, and the session/accessibility buses point at the private desktop; WAYLAND_DISPLAY is removed. Uses 'sh -c', so pipelines and quoting work. Returns the PID and log file path. Use wait_ms to detect immediate crashes and read the log for startup errors.",
+            "Launch an application or shell command inside the nested display. The binary comes from the host filesystem, but DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR, and the session/accessibility buses point at the private desktop; WAYLAND_DISPLAY is removed. Uses 'sh -c', so pipelines and quoting work. The process runs in its own group and keeps running after this call returns, even if its window closes or its screenshot is already written; running:true means it is still alive. Returns the PID and log path. Use wait_ms to detect immediate crashes, launch_status to check later, kill_process all=true to stop everything you launched, and display_stop to tear the desktop down and reap all of it.",
             schema(
                 json!({
                     "command": { "type": "string", "description": "Shell command to run, e.g. 'zenity --info --text hello' or 'xterm -e top'" },
@@ -366,14 +366,15 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "kill_process",
-            "Signal a process owned by the nested desktop. Only PIDs whose environment references this session's private runtime directory are accepted, so host processes cannot be targeted. signal defaults to TERM; set group=true for a launched command's whole process group.",
+            "Send a signal to a process in this session, or with all=true terminate every process this session launched and wait for them to exit. Only PIDs whose environment references this session's private runtime directory are accepted, so host processes cannot be targeted. Clean up test apps with all=true instead of leaving them running; display_stop reaps everything as well.",
             schema(
                 json!({
-                    "pid": { "type": "integer", "minimum": 2, "description": "PID from list_processes or launch" },
-                    "signal": { "type": "string", "enum": ["TERM", "KILL", "INT", "HUP", "QUIT"], "description": "Signal name (default TERM)" },
-                    "group": { "type": "boolean", "description": "Signal the process group when pid is its leader (default false)" }
+                    "pid": { "type": "integer", "minimum": 2, "description": "Process id to signal (omit when all=true)" },
+                    "all": { "type": "boolean", "description": "Terminate every process launched in this session (SIGTERM, then SIGKILL)" },
+                    "signal": { "type": "string", "enum": ["TERM", "KILL", "INT", "HUP", "QUIT"], "description": "Signal for a single pid (default TERM)" },
+                    "group": { "type": "boolean", "description": "Signal the whole process group of pid (default false)" }
                 }),
-                &["pid"],
+                &[],
             ),
         ),
         tool(
@@ -1073,7 +1074,6 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "kill_process" => {
             let session = active(manager).await?;
-            let pid = opt_u64(args, "pid").ok_or_else(|| anyhow!("missing pid"))? as u32;
             let signal = match opt_str(args, "signal")
                 .unwrap_or("TERM")
                 .to_ascii_uppercase()
@@ -1088,6 +1088,84 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             };
             let group = opt_bool(args, "group").unwrap_or(false);
             let runtime_dir = session.info.runtime_dir.clone();
+
+            // all=true is the one-call cleanup for agents: terminate every
+            // process this session launched, escalating to SIGKILL.
+            if opt_bool(args, "all").unwrap_or(false) {
+                let targets: Vec<u32> = session
+                    .launched()
+                    .into_iter()
+                    .map(|item| item.pid)
+                    .filter(|pid| session.running(*pid))
+                    .collect();
+                if targets.is_empty() {
+                    return Ok(CallResult::text(&json!({
+                        "display": session.info.display,
+                        "count": 0,
+                        "pids": [],
+                        "remaining": [],
+                        "note": "no launched processes were still running",
+                    })));
+                }
+                let term_targets = targets.clone();
+                let term_runtime = runtime_dir.clone();
+                let errors = tokio::task::spawn_blocking(move || {
+                    let mut errors: Vec<Value> = Vec::new();
+                    for pid in term_targets {
+                        if let Err(err) =
+                            proc::kill_session_process(pid, &term_runtime, libc::SIGTERM, true)
+                        {
+                            errors.push(json!({"pid": pid, "error": format!("{err:#}")}));
+                        }
+                    }
+                    errors
+                })
+                .await
+                .context("kill task failed")?;
+
+                // Give cooperative apps a moment, then force the rest.
+                for _ in 0..15 {
+                    if targets.iter().all(|pid| !session.running(*pid)) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let remaining: Vec<u32> = targets
+                    .iter()
+                    .copied()
+                    .filter(|pid| session.running(*pid))
+                    .collect();
+                if !remaining.is_empty() {
+                    let kill_targets = remaining.clone();
+                    let kill_runtime = runtime_dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        for pid in kill_targets {
+                            let _ =
+                                proc::kill_session_process(pid, &kill_runtime, libc::SIGKILL, true);
+                        }
+                    })
+                    .await
+                    .context("kill task failed")?;
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                let still_running: Vec<u32> = targets
+                    .iter()
+                    .copied()
+                    .filter(|pid| session.running(*pid))
+                    .collect();
+                return Ok(CallResult::text(&json!({
+                    "display": session.info.display,
+                    "count": targets.len(),
+                    "pids": targets,
+                    "remaining": still_running,
+                    "errors": errors,
+                    "ok": still_running.is_empty(),
+                    "note": "display_stop also reaps every launched process group",
+                })));
+            }
+
+            let pid =
+                opt_u64(args, "pid").ok_or_else(|| anyhow!("missing pid or all=true"))? as u32;
             tokio::task::spawn_blocking(move || {
                 proc::kill_session_process(pid, &runtime_dir, signal, group)
             })
