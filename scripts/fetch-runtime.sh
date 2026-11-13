@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Fetch the X runtime this project needs without root.
+# Fetch the desktop runtime this project needs without root.
 #
-# Xephyr and Xvfb are separate Arch packages, and openbox needs imlib2.  All of
-# their shared-library dependencies are already part of a normal desktop
-# install, so extracting the packages into ./.runtime is enough to run them.
+# Xephyr, Xvfb, and (optionally) sway are separate Arch packages, and openbox
+# needs imlib2.  All of their shared-library dependencies are already part of a
+# normal desktop install, so extracting the packages into ./.runtime is enough
+# to run them.
 #
-#   ./scripts/fetch-runtime.sh            # install into ./.runtime
-#   ./scripts/fetch-runtime.sh --dest DIR # install somewhere else
+#   ./scripts/fetch-runtime.sh             # install into ./.runtime
+#   ./scripts/fetch-runtime.sh --wayland   # also fetch sway + test clients
+#   ./scripts/fetch-runtime.sh --dest DIR  # install somewhere else
 #
 # The server and viewer look for this directory automatically.  You can also
 # use a system-wide install (pacman -S xorg-server-xephyr xorg-server-xvfb
-# openbox) and ignore this script entirely.
+# openbox sway grim wtype) and ignore this script entirely.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,13 +27,31 @@ PACKAGES=(
   imlib2
 )
 
+# Only needed by the Wayland backend and its smoke test.  wlroots is packaged
+# under a versioned name; override if Arch moves to a newer ABI.
+WAYLAND=false
+WLROOTS_PKG="${XEPHYR_MCP_WLROOTS_PKG:-wlroots0.20}"
+WAYLAND_PACKAGES=(
+  sway
+  "$WLROOTS_PKG"
+  libliftoff
+  grim
+  wtype
+  swaybg
+)
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --wayland) WAYLAND=true; shift ;;
     --dest) DEST="$2"; shift 2 ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+if $WAYLAND; then
+  PACKAGES+=("${WAYLAND_PACKAGES[@]}")
+fi
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -74,7 +94,7 @@ done
 # bin/ makes the runtime explicit on PATH; the libraries stay in usr/lib and
 # are only added to LD_LIBRARY_PATH for bundled helpers that need them.
 mkdir -p "$DEST/bin"
-for exe in Xephyr Xvfb openbox; do
+for exe in Xephyr Xvfb openbox sway swaymsg grim wtype swaybg; do
   if [[ -x "$DEST/usr/bin/$exe" && ! -e "$DEST/bin/$exe" ]]; then
     ln -s "../usr/bin/$exe" "$DEST/bin/$exe"
   fi
@@ -88,6 +108,17 @@ for exe in "$DEST/bin/Xephyr" "$DEST/bin/Xvfb" "$DEST/bin/openbox"; do
     echo "missing  $exe" >&2
   fi
 done
+
+if $WAYLAND; then
+  for exe in "$DEST/bin/sway" "$DEST/bin/swaymsg" "$DEST/bin/grim" \
+             "$DEST/bin/wtype"; do
+    if [[ -x "$exe" ]]; then
+      echo "ok       $exe"
+    else
+      echo "missing  $exe" >&2
+    fi
+  done
+fi
 
 echo
 echo "Runtime ready.  xephyr-mcp finds it automatically; add"

@@ -89,6 +89,24 @@ signal host processes. `kill_process all=true` is the one-call cleanup for
 agents: it sends `SIGTERM` to every launched process group, waits briefly, then
 `SIGKILL`s whatever is left. `tail_log` only reads inside the session log directory.
 
+## Wayland backend
+
+The Wayland backend is designed but not wired into the server yet. The plan,
+protocol mapping, capability model, and the parts sway does not support as
+expected are in [docs/wayland-backend.md](docs/wayland-backend.md). X11 remains
+the default and the tool catalog is unchanged until that work lands.
+
+To prepare a test compositor without root:
+
+```sh
+./scripts/fetch-runtime.sh --wayland
+./scripts/wayland-smoke.sh
+```
+
+The smoke test starts a private headless sway, verifies the output mode,
+captures it with `grim`, exercises floating move/resize and `wtype`, then shuts
+everything down. It never connects to the host compositor.
+
 ## Viewer
 
 ```sh
