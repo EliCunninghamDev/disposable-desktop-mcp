@@ -422,8 +422,8 @@ impl DisplayManager {
             tools: Tools::discover(),
             last_activity: AtomicU64::new(state::now()),
             active_calls: AtomicU64::new(0),
-            idle_timeout: seconds("DISPOSABLE_DESKTOP_MCP_IDLE_TIMEOUT_SECS"),
-            max_lifetime: seconds("DISPOSABLE_DESKTOP_MCP_MAX_LIFETIME_SECS"),
+            idle_timeout: seconds("XEPHYR_MCP_IDLE_TIMEOUT_SECS"),
+            max_lifetime: seconds("XEPHYR_MCP_MAX_LIFETIME_SECS"),
         }
     }
 
@@ -908,9 +908,7 @@ impl DisplayManager {
                 .arg("-dpi")
                 .arg("96")
                 .arg("-title")
-                .arg(format!(
-                    "disposable-desktop-mcp {display} ({width}x{height})"
-                ));
+                .arg(format!("xephyr-mcp {display} ({width}x{height})"));
             if let Some(host) = env::host_display() {
                 cmd.env("DISPLAY", host);
             }
@@ -1524,7 +1522,7 @@ fn write_marker(info: &SessionInfo) -> Result<()> {
     // next to the socket so discovery still works without the shared state
     // directory.
     use std::os::unix::fs::PermissionsExt;
-    let path = info.runtime_dir.join("disposable-desktop-mcp-session.json");
+    let path = info.runtime_dir.join("xephyr-mcp-session.json");
     std::fs::write(&path, info.state().marker_json())
         .with_context(|| format!("cannot write {}", path.display()))?;
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));

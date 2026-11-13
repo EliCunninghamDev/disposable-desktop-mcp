@@ -90,7 +90,7 @@ where
         bail!("capture buffer is empty");
     }
 
-    let name = c"disposable-desktop-mcp-shm";
+    let name = c"xephyr-mcp-shm";
     let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("memfd_create failed");

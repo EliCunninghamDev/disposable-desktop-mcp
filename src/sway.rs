@@ -519,8 +519,8 @@ pub fn host_input_ids(socket: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-const HOST_INPUT_BEGIN: &str = "# disposable-desktop-mcp host input begin";
-const HOST_INPUT_END: &str = "# disposable-desktop-mcp host input end";
+const HOST_INPUT_BEGIN: &str = "# xephyr-mcp host input begin";
+const HOST_INPUT_END: &str = "# xephyr-mcp host input end";
 
 /// Move every host input device to `seat0` (human) or the dummy `locked` seat
 /// (agent).  Sway's runtime `seat attach` is additive and is forgotten on

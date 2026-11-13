@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Root-window property used by the viewer to discover a nested display when
 /// no state file is available.
-pub const ROOT_MARKER: &str = "_DISPOSABLE_DESKTOP_MCP";
+pub const ROOT_MARKER: &str = "_XEPHYR_MCP";
 
 fn default_backend() -> String {
     "x11".to_string()
@@ -304,7 +304,7 @@ mod tests {
             "visible": false,
             "xserver": "Xvfb",
             "wm": "openbox",
-            "runtime_dir": "/run/user/1000/disposable-desktop-mcp/session-100-1",
+            "runtime_dir": "/run/user/1000/xephyr-mcp/session-100-1",
             "pids": [1, 2],
             "started_at": 1,
             "version": "0.1.0"
@@ -327,7 +327,7 @@ mod tests {
             "visible": false,
             "xserver": "sway",
             "wm": null,
-            "runtime_dir": "/run/user/1000/disposable-desktop-mcp/session-1-1",
+            "runtime_dir": "/run/user/1000/xephyr-mcp/session-1-1",
             "pids": [1],
             "started_at": 1,
             "version": "0.1.0"
@@ -335,8 +335,7 @@ mod tests {
         .unwrap();
         state.backend = "wayland".into();
         state.wayland_display = Some("wayland-1".into());
-        state.swaysock =
-            Some("/run/user/1000/disposable-desktop-mcp/session-1-1/sway-ipc.1000.1.sock".into());
+        state.swaysock = Some("/run/user/1000/xephyr-mcp/session-1-1/sway-ipc.1000.1.sock".into());
         state.output_name = Some("HEADLESS-1".into());
         state.capabilities = Some(crate::backend::Capabilities::wayland());
         let encoded = serde_json::to_string(&state).unwrap();

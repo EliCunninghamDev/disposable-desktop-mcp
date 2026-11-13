@@ -3,7 +3,7 @@
 This repository is an MCP server plus a human-facing desktop viewer.
 
 - Start desktops headless (`visible=false`, the default). Do not pass
-  `visible=true` and do not launch `disposable-desktop-viewer` unless the user
+  `visible=true` and do not launch `xephyr-mcp-viewer` unless the user
   explicitly asks to watch or interact with a session.
 - Verification must not open windows on the host desktop. Use headless sessions
   and a throwaway display if a GUI host is required, then clean up with

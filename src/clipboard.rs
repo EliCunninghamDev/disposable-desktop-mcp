@@ -34,7 +34,7 @@ impl Atoms {
             targets: x11::atom(conn, "TARGETS")?,
             utf8: x11::atom(conn, "UTF8_STRING")?,
             text: x11::atom(conn, "TEXT")?,
-            property: x11::atom(conn, "DISPOSABLE_DESKTOP_MCP_CLIPBOARD")?,
+            property: x11::atom(conn, "XEPHYR_MCP_CLIPBOARD")?,
         })
     }
 }
@@ -105,7 +105,7 @@ pub fn set(display: &str, text: &str) -> Result<usize> {
     let bytes = text.as_bytes().to_vec();
     let served = bytes.len();
     std::thread::Builder::new()
-        .name("disposable-desktop-clipboard".into())
+        .name("xephyr-clipboard".into())
         .spawn(move || serve(conn, window, atoms, bytes))
         .context("cannot start the clipboard owner thread")?;
     Ok(served)

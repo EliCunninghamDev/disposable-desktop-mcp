@@ -30,7 +30,7 @@ pub fn definitions() -> Vec<Value> {
     vec![
         tool(
             "display_start",
-            "Start a private, disposable desktop for GUI testing, screenshots, mouse/keyboard automation, and window management. Call this before any other disposable-desktop-mcp tool. Sessions are headless by default (visible=false); pass visible=true only when a person needs a watchable window on the host desktop. backend=\"x11\" (default) uses Xvfb when headless or Xephyr when visible. backend=\"wayland\" uses sway: headless by default, or a nested window on the host Wayland or X11 session when visible=true. X11 sessions get a window manager and private D-Bus/AT-SPI buses; Wayland sessions get sway, a private runtime dir, and the same private buses. Each server process owns one display: call display_stop before starting another, or run separate server instances with distinct session_id values for parallel desktops. Returns display, backend, capabilities, pids, dbus_address, runtime/log/home dirs, trace path, and accessibility status.",
+            "Start a private, disposable desktop for GUI testing, screenshots, mouse/keyboard automation, and window management. Call this before any other xephyr-mcp tool. Sessions are headless by default (visible=false); pass visible=true only when a person needs a watchable window on the host desktop. backend=\"x11\" (default) uses Xvfb when headless or Xephyr when visible. backend=\"wayland\" uses sway: headless by default, or a nested window on the host Wayland or X11 session when visible=true. X11 sessions get a window manager and private D-Bus/AT-SPI buses; Wayland sessions get sway, a private runtime dir, and the same private buses. Each server process owns one display: call display_stop before starting another, or run separate server instances with distinct session_id values for parallel desktops. Returns display, backend, capabilities, pids, dbus_address, runtime/log/home dirs, trace path, and accessibility status.",
             schema(
                 json!({
                     "width": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Screen width in pixels (default 1280)" },
@@ -465,7 +465,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "diagnose",
-            "Report which dependencies disposable-desktop-mcp found and their versions: Xephyr, Xvfb, window manager, xdotool, dbus, AT-SPI, PyGObject, runtime tree, host display, and active sessions. Use this first when a tool fails for environmental reasons.",
+            "Report which dependencies xephyr-mcp found and their versions: Xephyr, Xvfb, window manager, xdotool, dbus, AT-SPI, PyGObject, runtime tree, host display, and active sessions. Use this first when a tool fails for environmental reasons.",
             schema(json!({}), &[]),
         ),
         tool(
@@ -2004,9 +2004,9 @@ async fn diagnose(manager: &DisplayManager) -> Value {
             "The nested desktop defaults to X11; backend=wayland uses sway with output capture, sway-IPC window control, display resize, virtual pointer/keyboard input, and the data-control clipboard.",
             "A viewer claims human control with c; wait_for_control blocks until it is released, and input/a11y tools are refused meanwhile.",
             "AT-SPI requires PyGObject in the python3 environment (python_atspi).",
-            "DISPOSABLE_DESKTOP_MCP_IDLE_TIMEOUT_SECS and DISPOSABLE_DESKTOP_MCP_MAX_LIFETIME_SECS enable the auto-teardown watchdog.",
+            "XEPHYR_MCP_IDLE_TIMEOUT_SECS and XEPHYR_MCP_MAX_LIFETIME_SECS enable the auto-teardown watchdog.",
             "Set persist_home=true to keep app profiles across display_stop/display_start with the same session_id.",
-            "Set DISPOSABLE_DESKTOP_MCP_TRACE_SCREENSHOTS=1 to save before/after PNGs next to the JSONL trace (newest 400 kept per session).",
+            "Set XEPHYR_MCP_TRACE_SCREENSHOTS=1 to save before/after PNGs next to the JSONL trace (newest 400 kept per session).",
         ],
     })
 }

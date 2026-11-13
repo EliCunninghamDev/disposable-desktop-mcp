@@ -10,7 +10,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEST="${DISPOSABLE_DESKTOP_MCP_RUNTIME:-$REPO/.runtime}"
+DEST="${XEPHYR_MCP_RUNTIME:-$REPO/.runtime}"
 SWAY="$DEST/usr/bin/sway"
 SWAYMSG="$DEST/usr/bin/swaymsg"
 GRIM="$DEST/usr/bin/grim"
@@ -23,7 +23,7 @@ for exe in "$SWAY" "$SWAYMSG" "$GRIM"; do
   fi
 done
 
-RUN="$(mktemp -d "${TMPDIR:-/tmp}/disposable-desktop-mcp-sway.XXXXXX")"
+RUN="$(mktemp -d "${TMPDIR:-/tmp}/xephyr-mcp-sway.XXXXXX")"
 chmod 700 "$RUN"
 SWAY_PID=""
 cleanup() {

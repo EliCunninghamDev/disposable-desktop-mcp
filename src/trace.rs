@@ -194,7 +194,7 @@ fn newest_trace() -> Option<PathBuf> {
 /// Per-call trace screenshots are opt-in: each screen-changing call would
 /// otherwise pay for two full captures plus PNG encoding.
 pub fn screenshots_enabled() -> bool {
-    match std::env::var("DISPOSABLE_DESKTOP_MCP_TRACE_SCREENSHOTS") {
+    match std::env::var("XEPHYR_MCP_TRACE_SCREENSHOTS") {
         Ok(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"

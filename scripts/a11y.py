@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AT-SPI helper for disposable-desktop-mcp.
+"""AT-SPI helper for xephyr-mcp.
 
 Reads the accessibility tree, or activates an accessible by name, and prints a
 single JSON object on stdout.  Warnings from GTK/AT-SPI go to stderr and are

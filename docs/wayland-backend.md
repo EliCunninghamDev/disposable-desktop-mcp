@@ -374,7 +374,7 @@ control_since: Option<u64>,
 
 Keep `display` for the human-readable name (`:100` or `wayland-1`). The viewer
 uses the state file, not the X11 root marker. Also write a marker file next to
-the socket (`$XDG_RUNTIME_DIR/disposable-desktop-mcp-session.json`) with the same JSON, for
+the socket (`$XDG_RUNTIME_DIR/xephyr-mcp-session.json`) with the same JSON, for
 discovery when the shared state directory is unavailable. Aspect-lock hints
 stay best-effort.
 
@@ -392,7 +392,7 @@ host path (and host `DISPLAY`/`XAUTHORITY` for `WLR_BACKENDS=x11`).
 
 ## Control arbitration
 
-Ownership lives in `$XDG_RUNTIME_DIR/disposable-desktop-mcp/sessions/<id>.control.json`:
+Ownership lives in `$XDG_RUNTIME_DIR/xephyr-mcp/sessions/<id>.control.json`:
 
 ```json
 { "owner": "human", "pid": 1234, "since": 1794573677 }

@@ -1,4 +1,4 @@
-//! Live viewer for one or more disposable-desktop-mcp displays.
+//! Live viewer for one or more xephyr-mcp displays.
 //!
 //! The viewer is a small GTK4 application.  It captures each nested root window
 //! with GetImage, uploads the frame as a texture, and paints one pane (single
@@ -34,7 +34,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const TOOLBAR_H: i32 = 38;
 const MAX_PANES: usize = 8;
 const REFRESH: Duration = Duration::from_secs(2);
-const APP_ID: &str = "dev.disposabledesktop.Viewer";
+const APP_ID: &str = "dev.xephyr.mcp.Viewer";
 
 const COL_BG: (f32, f32, f32) = (0.055, 0.058, 0.068);
 const COL_PANE: (f32, f32, f32) = (0.035, 0.037, 0.043);
@@ -143,10 +143,10 @@ impl Default for Options {
 }
 
 fn usage() -> &'static str {
-    "disposable-desktop-viewer - live view of disposable-desktop-mcp nested displays
+    "xephyr-mcp-viewer - live view of xephyr-mcp nested displays
 
 USAGE:
-    disposable-desktop-viewer [OPTIONS]
+    xephyr-mcp-viewer [OPTIONS]
 
 OPTIONS:
     --display :N          Nested display to watch
@@ -155,7 +155,7 @@ OPTIONS:
     --layout single|bsp   Single session (default) or tile all live sessions
     --bsp                 Shorthand for --layout bsp
     --host-display :N     Display for the viewer window (defaults to $DISPLAY)
-    --state-file PATH     Session state file (default: $XDG_RUNTIME_DIR/disposable-desktop-mcp/current.json)
+    --state-file PATH     Session state file (default: $XDG_RUNTIME_DIR/xephyr-mcp/current.json)
     --title TEXT          Window title
     --fps N               Capture rate, 1-60 (default 15; capped at 10 in BSP)
     --scale N             Window size as a fraction of native pixels (default: fit 90% of host screen)
@@ -358,7 +358,7 @@ fn discover_target(options: &Options) -> Result<Target> {
     }
 
     bail!(
-        "no disposable-desktop-mcp display found. Start one with display_start, pass --display :N or \
+        "no xephyr-mcp display found. Start one with display_start, pass --display :N or \
          --session ID, or use --list. (state file: {})",
         options.state_file.display()
     )
@@ -566,13 +566,13 @@ pub fn run() -> Result<()> {
             if options.display.is_some() || options.session.is_some() {
                 return Err(err);
             }
-            eprintln!("[disposable-desktop-viewer] {err}");
+            eprintln!("[xephyr-mcp-viewer] {err}");
             None
         }
     };
     if let Some(target) = &first {
         eprintln!(
-            "[disposable-desktop-viewer] {} showing {} ({}x{})",
+            "[xephyr-mcp-viewer] {} showing {} ({}x{})",
             VERSION, target.display, target.width, target.height
         );
     }
@@ -588,7 +588,7 @@ pub fn run() -> Result<()> {
     let first_for_ui = first.clone();
     app.connect_activate(move |app| {
         if let Err(err) = build_ui(app, &options_for_ui, first_for_ui.clone()) {
-            eprintln!("[disposable-desktop-viewer] {err:#}");
+            eprintln!("[xephyr-mcp-viewer] {err:#}");
         }
     });
     // Args are parsed above; keep GApplication from rejecting our options.
@@ -605,7 +605,7 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
             options
                 .title
                 .clone()
-                .unwrap_or_else(|| "disposable desktop viewer".into()),
+                .unwrap_or_else(|| "xephyr mcp viewer".into()),
         )
         .build();
     window.set_resizable(true);
@@ -767,7 +767,7 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
                 if chord && matches!(keyval, gdk::Key::c | gdk::Key::C) {
                     if viewer.control_owned {
                         if let Err(err) = viewer.set_human(false) {
-                            eprintln!("[disposable-desktop-viewer] release control: {err:#}");
+                            eprintln!("[xephyr-mcp-viewer] release control: {err:#}");
                         }
                     }
                     return glib::Propagation::Stop;
@@ -791,7 +791,7 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
             let stop = match keyval {
                 gdk::Key::c | gdk::Key::C => {
                     if let Err(err) = viewer.set_human(true) {
-                        eprintln!("[disposable-desktop-viewer] claim control: {err:#}");
+                        eprintln!("[xephyr-mcp-viewer] claim control: {err:#}");
                     }
                     viewer.sync_buttons();
                     true
@@ -850,7 +850,7 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
                 return;
             }
             if let Err(err) = viewer.set_human(want) {
-                eprintln!("[disposable-desktop-viewer] control: {err:#}");
+                eprintln!("[xephyr-mcp-viewer] control: {err:#}");
             }
             viewer.sync_buttons();
         });
@@ -1021,7 +1021,7 @@ impl Viewer {
             control::release(&session_id, pid)?
         };
         if let Err(err) = target.backend.set_host_input(enabled) {
-            eprintln!("[disposable-desktop-viewer] host input: {err:#}");
+            eprintln!("[xephyr-mcp-viewer] host input: {err:#}");
         }
         self.control = state.owner;
         self.control_owned = state.owner == Owner::Human && state.pid == pid;
@@ -1416,7 +1416,7 @@ impl Viewer {
             ""
         };
         self.window.set_title(Some(&format!(
-            "disposable desktop viewer - {label} ({width}x{height}){suffix}{control}"
+            "xephyr mcp viewer - {label} ({width}x{height}){suffix}{control}"
         )));
     }
 

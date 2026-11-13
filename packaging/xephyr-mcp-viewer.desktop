@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Xephyr MCP Viewer
+GenericName=Private Desktop Viewer
+Comment=Watch private X11 or Wayland desktops started by xephyr-mcp
+Exec=xephyr-mcp-viewer
+TryExec=xephyr-mcp-viewer
+Icon=video-display
+Terminal=false
+Categories=Development;
+Keywords=xephyr;desktop;viewer;mcp;virtual;display;screenshot;x11;wayland;
+StartupNotify=true
+StartupWMClass=xephyr-mcp-viewer
+Actions=bsp;
+
+[Desktop Action bsp]
+Name=Open in BSP tiling mode
+Exec=xephyr-mcp-viewer --layout bsp
