@@ -146,6 +146,23 @@ viewer invocation is a separate process and window.
 Useful options: `--host-display :N`, `--fps N`, `--scale N`,
 `--no-aspect-lock`, `--no-cursor`, `--fullscreen`, `--title`.
 
+### Desktop shortcut
+
+`packaging/xephyr-mcp-viewer.desktop` adds the viewer to KRunner, the Plasma
+application menu, and other desktop launchers. It also provides an
+"Open in BSP tiling mode" action.
+
+```sh
+install -Dm644 packaging/xephyr-mcp-viewer.desktop \
+  ~/.local/share/applications/xephyr-mcp-viewer.desktop
+update-desktop-database ~/.local/share/applications
+kbuildsycoca6        # Plasma 6 (kbuildsycoca5 on Plasma 5)
+```
+
+The packaged entry uses `Exec=xephyr-mcp-viewer`, so `~/.cargo/bin` (or wherever
+`cargo install` placed it) must be on the desktop session's `PATH`. If it is
+not, replace the `Exec=` and `TryExec=` lines with the absolute binary path.
+
 ## Isolation model
 
 `display_start` builds a scrubbed environment for every nested process:

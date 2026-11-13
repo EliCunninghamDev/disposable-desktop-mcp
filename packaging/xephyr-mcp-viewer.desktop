@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Xephyr MCP Viewer
+GenericName=Nested X Desktop Viewer
+Comment=Watch one or more private Xephyr/Xvfb desktops started by xephyr-mcp
+Exec=xephyr-mcp-viewer
+TryExec=xephyr-mcp-viewer
+Icon=video-display
+Terminal=false
+Categories=Development;
+Keywords=xephyr;x11;desktop;viewer;mcp;virtual;display;screenshot;
+StartupNotify=true
+StartupWMClass=xephyr-mcp-viewer
+Actions=bsp;
+
+[Desktop Action bsp]
+Name=Open in BSP tiling mode
+Exec=xephyr-mcp-viewer --layout bsp
