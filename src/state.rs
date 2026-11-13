@@ -22,6 +22,10 @@ pub struct State {
     pub xserver: String,
     pub wm: Option<String>,
     pub runtime_dir: String,
+    #[serde(default)]
+    pub home: Option<String>,
+    #[serde(default)]
+    pub persistent_home: bool,
     pub pids: Vec<u32>,
     pub started_at: u64,
     pub version: String,
@@ -46,6 +50,15 @@ pub fn sessions_dir() -> PathBuf {
 
 pub fn session_path(session_id: &str) -> PathBuf {
     sessions_dir().join(format!("{session_id}.json"))
+}
+
+/// Directory used as HOME for a persistent session.  It lives outside the
+/// per-session runtime tree so `display_stop` leaves profiles behind.
+pub fn session_home(session_id: &str) -> Result<PathBuf> {
+    crate::display::validate_session_id(session_id)?;
+    Ok(crate::env::shared_runtime_dir()
+        .join("homes")
+        .join(session_id))
 }
 
 fn write_atomic(path: &Path, state: &State) -> Result<()> {

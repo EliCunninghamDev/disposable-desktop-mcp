@@ -46,6 +46,12 @@ and the host session bus are never used.
 - **Clipboard and process tools.** In-process CLIPBOARD ownership avoids
   per-character typing, and session-scoped process/log tools make failed
   launches diagnosable.
+- **Runtime control.** XRandR resizing on Xephyr, EWMH window state changes,
+  held mouse/key input, persistent per-session HOME, and an auto-teardown
+  watchdog.
+- **Trace and marks.** Every tool call is appended to a JSONL trace with
+  before/after frame hashes, and screenshots can draw numbered accessibility
+  targets for reliable `click(mark=N)` routing.
 - **Live viewer.** A GTK4 window with a native session dropdown, Single/BSP
   layout buttons, aspect-ratio locking, and double-buffered painting.
 - **Cleanup.** Child process groups, the bus daemons, and the display are
@@ -101,13 +107,15 @@ definitions and handlers are in `src/tools.rs`; `src/mcp.rs` is the adapter.
 
 | Tool | Purpose |
 | --- | --- |
-| `display_start` | Start the nested desktop. Parameters: `width`, `height`, `visible` (Xephyr vs Xvfb), `session_id`. |
+| `display_start` | Start the nested desktop. Parameters: `width`, `height`, `visible` (Xephyr vs Xvfb), `session_id`, `persist_home`. |
 | `display_stop` | Stop the display and every child process it owns. |
 | `launch` | Run a shell command inside the nested display (`command`, `wait_ms`). |
-| `screenshot` | Capture PNG (`max_width`, `max_height`, `region`, `window_id`, `cursor`, `grid`, `native`). |
+| `screenshot` | Capture PNG (`max_width`, `max_height`, `region`, `window_id`, `cursor`, `grid`, `marks`, `mark_limit`, `native`). |
 | `wait_for` | Block on `window`, `process_exit`, `screen_stable`, `region_change`, or `file_exists`. |
 | `wait_for_idle` | Block until the screen (or a region) stops changing. |
-| `click` | Click at display coordinates (`x`, `y`, `button`, `count`). |
+| `click` | Click at display coordinates or a screenshot mark (`x`, `y`, `mark`, `button`, `count`, `modifiers`). |
+| `mouse_down` / `mouse_up` | Hold or release a mouse button (optional `x`/`y`). |
+| `key_down` / `key_up` | Hold or release a key or modifier. |
 | `move` | Move the nested pointer. |
 | `drag` | Drag from `x1,y1` to `x2,y2` (`button`, `duration_ms`). |
 | `scroll` | Wheel scroll (`direction`, `amount`, optional `x`,`y`). |
@@ -119,12 +127,15 @@ definitions and handlers are in `src/tools.rs`; `src/mcp.rs` is the adapter.
 | `focus_window` | Activate a window by `id`. |
 | `move_resize_window` | Move/resize a window (`id`, `x`, `y`, `width`, `height`). |
 | `close_window` | Ask a window to close (`id`, `force`). |
+| `window_state` | Minimize, maximize, restore, fullscreen, raise/lower, always-on-top, or query state (`id`, `action`). |
+| `resize_display` | Resize the nested desktop with RandR (`width`, `height`, optional `refresh`). |
+| `trace_tail` | Read the JSONL tool trace (`session_id`, `lines`). |
 | `list_processes` | List processes owned by the session (pid, ppid, pgid, command). |
 | `kill_process` | Signal a session-owned process (`pid`, `signal`, `group`). |
 | `tail_log` | Read the tail of a launch or session log (`file`, `lines`). |
-| `a11y_tree` | Dump the AT-SPI tree (`max_depth`, `max_nodes`, `app`). |
-| `a11y_find` | Query accessible nodes by `name` and/or `role` without dumping the tree. |
-| `a11y_click` | Click an accessible element by `name`, optional `role`/`index`. |
+| `a11y_tree` | Dump the AT-SPI tree, or one subtree with `path` (`max_depth`, `max_nodes`, `app`). |
+| `a11y_find` | Query accessible nodes by `name`, `role`, `state`, `action`, and `path` without dumping the tree. |
+| `a11y_click` | Activate an accessible by `name` or `path`, optional `role`/`index`. |
 | `a11y_set_text` | Set an editable field's contents via the EditableText interface. |
 | `a11y_focus` | Give keyboard focus to an accessible element. |
 | `diagnose` | Report dependency paths/versions, host display, and active sessions. |
@@ -149,6 +160,33 @@ image back to display coordinates: `display = image / scale + origin`. Crops
 A timeout is returned as a successful result with `"timed_out": true` and
 `"satisfied": false`, so an agent can inspect state or retry. Settling on a
 region avoids waiting forever on clocks and animated backgrounds.
+
+## Phase 2 controls
+
+`click` accepts `count` for double/triple clicks and `modifiers` (for example
+`["ctrl","shift"]`) held for the click. `mouse_down`/`mouse_up` and
+`key_down`/`key_up` keep state across calls for drag-selection and games.
+`window_state` applies EWMH state changes; `resize_display` switches Xephyr to
+one of its built-in modes (Xvfb only offers its startup size and returns a clear
+error).
+
+With `screenshot marks=true`, actionable accessibility elements are numbered
+and their centers are recorded. `click mark=N` targets that element; when it has
+an accessibility action (buttons, menu items, check boxes), the action is
+invoked directly, so it does not depend on pixel geometry. GTK4 still reports
+unreliable child coordinates, so the drawn boxes are approximate there, but the
+mark mapping and action routing are reliable. Use `a11y_click path=...` for the
+same reason.
+
+Every tool call is appended to
+`$XDG_RUNTIME_DIR/xephyr-mcp/traces/<session_id>.jsonl` with the sanitized
+arguments, duration, outcome, and before/after frame hashes for screen-changing
+tools. Traces survive `display_stop`; read them with `trace_tail`. Set
+`persist_home=true` on `display_start` to keep `HOME` and XDG directories under
+`$XDG_RUNTIME_DIR/xephyr-mcp/homes/<session_id>` across restarts with the same
+session id. Set `XEPHYR_MCP_IDLE_TIMEOUT_SECS` or
+`XEPHYR_MCP_MAX_LIFETIME_SECS` to enable the watchdog, which tears down a
+desktop when no tool call is active and the limit has elapsed.
 
 The clipboard tools own the X `CLIPBOARD` selection directly (a background
 thread answers `SelectionRequest`); the host clipboard is never used. Direct

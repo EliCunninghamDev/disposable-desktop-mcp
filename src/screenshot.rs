@@ -84,6 +84,19 @@ pub fn capture_window(display: &str, window: u32) -> Result<Frame> {
     capture_drawable(&conn, window, 0, 0, geometry.width, geometry.height)
 }
 
+/// Root coordinates of a window's top-left client corner.
+pub fn window_origin(display: &str, window: u32) -> Result<(i32, i32)> {
+    let (conn, screen_num) = x11rb::connect(Some(display))
+        .with_context(|| format!("cannot connect to nested display {display}"))?;
+    let root = conn.setup().roots[screen_num].root;
+    let reply = conn
+        .translate_coordinates(window, root, 0, 0)
+        .context("TranslateCoordinates failed")?
+        .reply()
+        .context("window does not exist")?;
+    Ok((i32::from(reply.dst_x), i32::from(reply.dst_y)))
+}
+
 fn capture_drawable(
     conn: &RustConnection,
     drawable: u32,
@@ -456,6 +469,164 @@ fn blend(frame: &mut Frame, x: u32, y: u32, color: (u8, u8, u8), alpha: f32) {
         frame.rgba[offset + channel] = (*source as f32 * alpha + dst * (1.0 - alpha)).round() as u8;
     }
 }
+
+/// Draw numbered boxes around accessibility targets.  Each tuple is
+/// `(mark, x, y, width, height)` in root coordinates; `origin` is the root
+/// coordinate of the frame's top-left corner.
+pub fn draw_marks(
+    frame: &mut Frame,
+    marks: &[(u32, i32, i32, u32, u32)],
+    origin_x: i32,
+    origin_y: i32,
+) {
+    for &(mark, x, y, width, height) in marks {
+        let left = x - origin_x;
+        let top = y - origin_y;
+        let right = left + width as i32 - 1;
+        let bottom = top + height as i32 - 1;
+        if right < 0 || bottom < 0 || left >= frame.width as i32 || top >= frame.height as i32 {
+            continue;
+        }
+        let color = (0, 220, 160);
+        for offset in 0..2 {
+            stroke_rect(
+                frame,
+                left - offset,
+                top - offset,
+                right + offset,
+                bottom + offset,
+                color,
+            );
+        }
+
+        // Label sits just above the box unless that would leave the frame.
+        let digits = mark.to_string();
+        let scale = 2u32;
+        let label_width = digits.len() as u32 * 6 * scale + 6;
+        let label_height = 7 * scale + 4;
+        let mut label_x = left.max(0);
+        let mut label_y = top - label_height as i32 - 1;
+        if label_y < 0 {
+            label_y = top + 1;
+        }
+        if label_x + label_width as i32 > frame.width as i32 {
+            label_x = frame.width as i32 - label_width as i32;
+        }
+        if label_x >= 0 && label_y >= 0 {
+            fill_rect(
+                frame,
+                label_x,
+                label_y,
+                label_width as i32,
+                label_height as i32,
+                (12, 24, 20),
+            );
+            draw_digits(
+                frame,
+                &digits,
+                label_x as u32 + 3,
+                label_y as u32 + 2,
+                scale,
+            );
+        }
+    }
+}
+
+fn stroke_rect(
+    frame: &mut Frame,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    color: (u8, u8, u8),
+) {
+    for x in left.max(0)..=right.min(frame.width as i32 - 1) {
+        if top >= 0 {
+            blend(frame, x as u32, top as u32, color, 0.9);
+        }
+        if bottom >= 0 && bottom < frame.height as i32 {
+            blend(frame, x as u32, bottom as u32, color, 0.9);
+        }
+    }
+    for y in top.max(0)..=bottom.min(frame.height as i32 - 1) {
+        if left >= 0 {
+            blend(frame, left as u32, y as u32, color, 0.9);
+        }
+        if right >= 0 && right < frame.width as i32 {
+            blend(frame, right as u32, y as u32, color, 0.9);
+        }
+    }
+}
+
+fn fill_rect(frame: &mut Frame, x: i32, y: i32, width: i32, height: i32, color: (u8, u8, u8)) {
+    for py in y..y + height {
+        for px in x..x + width {
+            if px >= 0 && py >= 0 && px < frame.width as i32 && py < frame.height as i32 {
+                blend(frame, px as u32, py as u32, color, 0.92);
+            }
+        }
+    }
+}
+
+fn draw_digits(frame: &mut Frame, digits: &str, x: u32, y: u32, scale: u32) {
+    let mut cursor = x;
+    for ch in digits.chars() {
+        let Some(digit) = ch.to_digit(10) else {
+            continue;
+        };
+        let rows = DIGITS[digit as usize];
+        for (row, bits) in rows.iter().enumerate() {
+            for column in 0..5u32 {
+                if bits & (1 << (4 - column)) != 0 {
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            let px = cursor + column * scale + dx;
+                            let py = y + row as u32 * scale + dy;
+                            if px < frame.width && py < frame.height {
+                                blend(frame, px, py, (240, 255, 250), 1.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cursor += 6 * scale;
+    }
+}
+
+/// Five-pixel-wide digit bitmaps.
+const DIGITS: [[u8; 7]; 10] = [
+    [
+        0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+    ],
+    [
+        0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+    ],
+    [
+        0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+    ],
+    [
+        0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+    ],
+    [
+        0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+    ],
+    [
+        0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+    ],
+    [
+        0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+    ],
+    [
+        0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+    ],
+    [
+        0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+    ],
+    [
+        0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+    ],
+];
 
 pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();

@@ -103,6 +103,8 @@ pub struct SessionInfo {
     pub runtime_dir: PathBuf,
     pub xauthority: PathBuf,
     pub log_dir: PathBuf,
+    pub home: Option<PathBuf>,
+    pub persistent_home: bool,
     pub started_at: u64,
 }
 
@@ -140,6 +142,9 @@ impl SessionInfo {
             "accessibility": self.a11y_ready,
             "runtime_dir": self.runtime_dir.display().to_string(),
             "log_dir": self.log_dir.display().to_string(),
+            "home": self.home.as_ref().map(|path| path.display().to_string()),
+            "persistent_home": self.persistent_home,
+            "trace": crate::trace::session_path(&self.session_id).display().to_string(),
             "state_file": env::state_file().display().to_string(),
             "started_at": self.started_at,
         })
@@ -157,6 +162,8 @@ impl SessionInfo {
             xserver: self.xserver.clone(),
             wm: self.wm.clone(),
             runtime_dir: self.runtime_dir.display().to_string(),
+            home: self.home.as_ref().map(|path| path.display().to_string()),
+            persistent_home: self.persistent_home,
             pids: self.pids(),
             started_at: self.started_at,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -175,6 +182,10 @@ pub struct Launched {
 pub struct Session {
     pub info: SessionInfo,
     pub launched: Mutex<Vec<Launched>>,
+    /// Current display size.  RandR resizing changes this after start.
+    size: Mutex<(u32, u32)>,
+    /// Numbered elements from the most recent set-of-marks screenshot.
+    marks: Mutex<Vec<crate::a11y::Mark>>,
     launch_seq: AtomicU64,
 }
 
@@ -204,7 +215,59 @@ impl Session {
         push("GTK_A11Y", "atspi".into());
         push("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1".into());
         push("TERM", "xterm-256color".into());
+        if let Some(home) = &self.info.home {
+            for (key, path) in [
+                ("HOME", home.clone()),
+                ("XDG_CONFIG_HOME", home.join(".config")),
+                ("XDG_DATA_HOME", home.join(".local/share")),
+                ("XDG_STATE_HOME", home.join(".local/state")),
+                ("XDG_CACHE_HOME", home.join(".cache")),
+            ] {
+                let _ = std::fs::create_dir_all(&path);
+                push(key, path.display().to_string());
+            }
+        }
         entries
+    }
+
+    pub fn width(&self) -> u32 {
+        self.size
+            .lock()
+            .map(|size| size.0)
+            .unwrap_or(self.info.width)
+    }
+
+    pub fn height(&self) -> u32 {
+        self.size
+            .lock()
+            .map(|size| size.1)
+            .unwrap_or(self.info.height)
+    }
+
+    /// Record a RandR resize and refresh the state file the viewer watches.
+    pub fn set_size(&self, width: u32, height: u32) -> Result<()> {
+        if let Ok(mut size) = self.size.lock() {
+            *size = (width, height);
+        }
+        let mut info = self.info.clone();
+        info.width = width;
+        info.height = height;
+        state::write(&info.state())?;
+        let _ = write_root_marker(&info);
+        Ok(())
+    }
+
+    pub fn set_marks(&self, marks: Vec<crate::a11y::Mark>) {
+        if let Ok(mut current) = self.marks.lock() {
+            *current = marks;
+        }
+    }
+
+    pub fn marks(&self) -> Vec<crate::a11y::Mark> {
+        self.marks
+            .lock()
+            .map(|marks| marks.clone())
+            .unwrap_or_default()
     }
 
     pub fn launch_count(&self) -> usize {
@@ -256,14 +319,67 @@ impl StopReport {
 pub struct DisplayManager {
     inner: tokio::sync::Mutex<Option<Arc<Session>>>,
     pub tools: Tools,
+    /// Unix seconds of the last tool call, used by the idle watchdog.
+    last_activity: AtomicU64,
+    /// Calls currently executing; the watchdog must not stop a busy desktop.
+    active_calls: AtomicU64,
+    pub idle_timeout: Option<Duration>,
+    pub max_lifetime: Option<Duration>,
 }
 
 impl DisplayManager {
     pub fn new() -> Self {
+        let seconds = |key: &str| -> Option<Duration> {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .map(Duration::from_secs)
+        };
         Self {
             inner: tokio::sync::Mutex::new(None),
             tools: Tools::discover(),
+            last_activity: AtomicU64::new(state::now()),
+            active_calls: AtomicU64::new(0),
+            idle_timeout: seconds("XEPHYR_MCP_IDLE_TIMEOUT_SECS"),
+            max_lifetime: seconds("XEPHYR_MCP_MAX_LIFETIME_SECS"),
         }
+    }
+
+    pub fn begin_call(&self) {
+        self.active_calls.fetch_add(1, Ordering::Relaxed);
+        self.touch();
+    }
+
+    pub fn end_call(&self) {
+        self.touch();
+        self.active_calls.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn touch(&self) {
+        self.last_activity.store(state::now(), Ordering::Relaxed);
+    }
+
+    /// True when the idle timeout or maximum lifetime has elapsed and no tool
+    /// call is in flight.
+    pub fn should_auto_stop(&self, running_for: Duration) -> Option<&'static str> {
+        if self.active_calls.load(Ordering::Relaxed) > 0 {
+            return None;
+        }
+        if let Some(limit) = self.idle_timeout {
+            let idle = Duration::from_secs(
+                state::now().saturating_sub(self.last_activity.load(Ordering::Relaxed)),
+            );
+            if idle >= limit {
+                return Some("idle timeout");
+            }
+        }
+        if let Some(limit) = self.max_lifetime {
+            if running_for >= limit {
+                return Some("maximum lifetime");
+            }
+        }
+        None
     }
 
     pub async fn session(&self) -> Option<Arc<Session>> {
@@ -276,6 +392,7 @@ impl DisplayManager {
         height: u32,
         visible: bool,
         session_id: Option<String>,
+        persist_home: bool,
     ) -> Result<StartReport> {
         if !(64..=8192).contains(&width) || !(64..=8192).contains(&height) {
             bail!("width and height must be between 64 and 8192 pixels");
@@ -301,8 +418,8 @@ impl DisplayManager {
             bail!(
                 "a nested display is already running at {} ({}x{}); call display_stop first",
                 session.info.display,
-                session.info.width,
-                session.info.height
+                session.width(),
+                session.height()
             );
         }
 
@@ -365,6 +482,7 @@ impl DisplayManager {
                     &xserver_name,
                     server_pid,
                     &session_id,
+                    persist_home,
                     &mut warnings,
                 )
                 .await
@@ -375,6 +493,8 @@ impl DisplayManager {
                     let session = Arc::new(Session {
                         info: info.clone(),
                         launched: Mutex::new(Vec::new()),
+                        size: Mutex::new((info.width, info.height)),
+                        marks: Mutex::new(Vec::new()),
                         launch_seq: AtomicU64::new(0),
                     });
                     *guard = Some(session);
@@ -403,6 +523,7 @@ impl DisplayManager {
         xserver_name: &str,
         server_pid: u32,
         session_id: &str,
+        persist_home: bool,
         warnings: &mut Vec<String>,
     ) -> Result<SessionInfo> {
         let display = format!(":{number}");
@@ -411,6 +532,17 @@ impl DisplayManager {
             .with_context(|| format!("cannot create {}", runtime_dir.display()))?;
         let log_dir = runtime_dir.join("logs");
         env::create_private_dir(&log_dir)?;
+
+        let home = if persist_home {
+            let home = state::session_home(session_id)?;
+            env::create_private_dir(&home)?;
+            for child in [".config", ".local/share", ".local/state", ".cache"] {
+                let _ = std::fs::create_dir_all(home.join(child));
+            }
+            Some(home)
+        } else {
+            None
+        };
 
         let xauthority = runtime_dir.join("Xauthority");
         OpenOptions::new()
@@ -513,6 +645,8 @@ impl DisplayManager {
             runtime_dir: runtime_dir.clone(),
             xauthority: xauthority.clone(),
             log_dir: log_dir.clone(),
+            home,
+            persistent_home: persist_home,
             started_at: state::now(),
         };
 
@@ -840,6 +974,25 @@ async fn init_accessibility(info: &SessionInfo, runtime_dir: &Path, xauthority: 
 
 fn info_env(info: &SessionInfo, runtime_dir: &Path, xauthority: &Path) -> Vec<(String, String)> {
     let mut entries = env::base_environment();
+    if let Some(home) = &info.home {
+        entries.push(("HOME".into(), home.display().to_string()));
+        entries.push((
+            "XDG_CONFIG_HOME".into(),
+            home.join(".config").display().to_string(),
+        ));
+        entries.push((
+            "XDG_DATA_HOME".into(),
+            home.join(".local/share").display().to_string(),
+        ));
+        entries.push((
+            "XDG_STATE_HOME".into(),
+            home.join(".local/state").display().to_string(),
+        ));
+        entries.push((
+            "XDG_CACHE_HOME".into(),
+            home.join(".cache").display().to_string(),
+        ));
+    }
     entries.push(("DISPLAY".into(), info.display.clone()));
     entries.push(("DBUS_SESSION_BUS_ADDRESS".into(), info.dbus_address.clone()));
     entries.push(("XDG_RUNTIME_DIR".into(), runtime_dir.display().to_string()));
@@ -922,7 +1075,7 @@ fn missing_xvfb_hint() -> String {
         .into()
 }
 
-fn validate_session_id(id: &str) -> Result<()> {
+pub fn validate_session_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 64 {
         bail!("session_id must be 1-64 characters");
     }

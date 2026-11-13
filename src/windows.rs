@@ -1,7 +1,7 @@
 //! EWMH window listing, focus, move/resize and close.
 
 use crate::x11;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
@@ -66,6 +66,12 @@ struct Atoms {
     wm_protocols: Atom,
     wm_delete: Atom,
     wm_state: Atom,
+    wm_change_state: Atom,
+    net_wm_state: Atom,
+    state_maximized_vert: Atom,
+    state_maximized_horz: Atom,
+    state_fullscreen: Atom,
+    state_above: Atom,
 }
 
 impl Atoms {
@@ -85,6 +91,12 @@ impl Atoms {
             wm_protocols: x11::atom(conn, "WM_PROTOCOLS")?,
             wm_delete: x11::atom(conn, "WM_DELETE_WINDOW")?,
             wm_state: x11::atom(conn, "WM_STATE")?,
+            wm_change_state: x11::atom(conn, "WM_CHANGE_STATE")?,
+            net_wm_state: x11::atom(conn, "_NET_WM_STATE")?,
+            state_maximized_vert: x11::atom(conn, "_NET_WM_STATE_MAXIMIZED_VERT")?,
+            state_maximized_horz: x11::atom(conn, "_NET_WM_STATE_MAXIMIZED_HORZ")?,
+            state_fullscreen: x11::atom(conn, "_NET_WM_STATE_FULLSCREEN")?,
+            state_above: x11::atom(conn, "_NET_WM_STATE_ABOVE")?,
         })
     }
 }
@@ -403,6 +415,212 @@ fn geometry_json(conn: &RustConnection, id: Window, fallback: bool) -> Value {
         }),
         Err(err) => json!({"id": id, "error": err.to_string(), "fallback": fallback}),
     }
+}
+
+/// Apply a window-management action through EWMH.  `action=state` only
+/// reports the current state.
+pub fn action(display: &str, id: Window, action: &str) -> Result<Value> {
+    let (conn, screen_num) = x11::connect(display)?;
+    let root = x11::root(&conn, screen_num);
+    let atoms = Atoms::new(&conn)?;
+
+    // Verify the window still exists before sending anything.
+    let _ = conn
+        .get_window_attributes(id)?
+        .reply()
+        .context("window does not exist")?;
+
+    let normalized = action.trim().to_ascii_lowercase().replace('-', "_");
+    let mut applied = normalized.clone();
+    let mut minimize = false;
+
+    match normalized.as_str() {
+        "minimize" | "minimise" | "iconify" => {
+            minimize = true;
+            let data = [3u32, 0, 0, 0, 0]; // IconicState
+            x11::send_client_message(
+                &conn,
+                root,
+                id,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                atoms.wm_change_state,
+                data,
+            )?;
+        }
+        "maximize" | "maximise" => {
+            set_state(
+                &conn,
+                root,
+                id,
+                &atoms,
+                1,
+                atoms.state_maximized_vert,
+                atoms.state_maximized_horz,
+            )?;
+        }
+        "unmaximize" | "unmaximise" => {
+            set_state(
+                &conn,
+                root,
+                id,
+                &atoms,
+                0,
+                atoms.state_maximized_vert,
+                atoms.state_maximized_horz,
+            )?;
+        }
+        "restore" => {
+            set_state(
+                &conn,
+                root,
+                id,
+                &atoms,
+                0,
+                atoms.state_maximized_vert,
+                atoms.state_maximized_horz,
+            )?;
+            set_state(
+                &conn,
+                root,
+                id,
+                &atoms,
+                0,
+                atoms.state_fullscreen,
+                x11rb::NONE,
+            )?;
+            conn.map_window(id)?;
+        }
+        "fullscreen" | "full_screen" => {
+            set_state(
+                &conn,
+                root,
+                id,
+                &atoms,
+                1,
+                atoms.state_fullscreen,
+                x11rb::NONE,
+            )?;
+        }
+        "unfullscreen" | "exit_fullscreen" => {
+            set_state(
+                &conn,
+                root,
+                id,
+                &atoms,
+                0,
+                atoms.state_fullscreen,
+                x11rb::NONE,
+            )?;
+        }
+        "raise" | "above" => {
+            conn.configure_window(
+                id,
+                &ConfigureWindowAux::new().stack_mode(x11rb::protocol::xproto::StackMode::ABOVE),
+            )?
+            .check()?;
+        }
+        "lower" | "below" => {
+            conn.configure_window(
+                id,
+                &ConfigureWindowAux::new().stack_mode(x11rb::protocol::xproto::StackMode::BELOW),
+            )?
+            .check()?;
+        }
+        "set_always_on_top" | "always_on_top" | "always_above" => {
+            set_state(&conn, root, id, &atoms, 1, atoms.state_above, x11rb::NONE)?;
+            applied = "set_always_on_top".into();
+        }
+        "clear_always_on_top" | "unset_always_on_top" | "always_on_top_off" => {
+            set_state(&conn, root, id, &atoms, 0, atoms.state_above, x11rb::NONE)?;
+            applied = "clear_always_on_top".into();
+        }
+        "state" | "query" => {
+            applied = "state".into();
+        }
+        other => {
+            return Err(anyhow!(
+                "unknown window action {other:?}; use minimize, maximize, unmaximize, restore, \
+                 fullscreen, unfullscreen, raise, lower, set_always_on_top, \
+                 clear_always_on_top, or state"
+            ))
+        }
+    }
+    conn.flush()?;
+
+    // Give the manager time to apply the request; minimization is async.
+    let deadline = Instant::now() + Duration::from_millis(if minimize { 1200 } else { 350 });
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let minimized = conn
+            .get_window_attributes(id)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|attr| attr.map_state != MapState::VIEWABLE)
+            .unwrap_or(false);
+        if !minimize || minimized || Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    let names = state_names(&conn, id, &atoms)?;
+    let minimized = conn
+        .get_window_attributes(id)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .map(|attr| attr.map_state != MapState::VIEWABLE)
+        .unwrap_or(false);
+    let geometry = x11::window_rect(&conn, id).ok();
+    let focused = active_id(&conn, root, &atoms) == Some(id);
+
+    Ok(json!({
+        "id": id,
+        "action": applied,
+        "requested": action,
+        "states": names,
+        "minimized": minimized,
+        "fullscreen": names.iter().any(|name| name == "_NET_WM_STATE_FULLSCREEN"),
+        "maximized": names.iter().any(|name| name == "_NET_WM_STATE_MAXIMIZED_VERT")
+            && names.iter().any(|name| name == "_NET_WM_STATE_MAXIMIZED_HORZ"),
+        "always_on_top": names.iter().any(|name| name == "_NET_WM_STATE_ABOVE"),
+        "focused": focused,
+        "geometry": geometry.map(|(x, y, width, height)| json!({
+            "x": x, "y": y, "width": width, "height": height
+        })),
+    }))
+}
+
+fn set_state(
+    conn: &RustConnection,
+    root: Window,
+    id: Window,
+    atoms: &Atoms,
+    operation: u32,
+    first: Atom,
+    second: Atom,
+) -> Result<()> {
+    x11::send_client_message(
+        conn,
+        root,
+        id,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        atoms.net_wm_state,
+        [operation, first, second, 1, 0],
+    )?;
+    Ok(())
+}
+
+fn state_names(conn: &RustConnection, id: Window, atoms: &Atoms) -> Result<Vec<String>> {
+    let values =
+        x11::get_u32s(conn, id, atoms.net_wm_state, AtomEnum::ATOM.into())?.unwrap_or_default();
+    let mut names = Vec::new();
+    for atom in values {
+        if let Ok(cookie) = conn.get_atom_name(atom) {
+            if let Ok(reply) = cookie.reply() {
+                names.push(String::from_utf8_lossy(&reply.name).into_owned());
+            }
+        }
+    }
+    Ok(names)
 }
 
 pub fn close(display: &str, id: Window, force: bool) -> Result<Value> {

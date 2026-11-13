@@ -65,6 +65,19 @@ pub fn button_number(button: &str) -> Result<u32> {
     }
 }
 
+pub fn modifier_key(name: &str) -> Result<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => Ok("ctrl"),
+        "shift" => Ok("shift"),
+        "alt" | "option" => Ok("alt"),
+        "super" | "meta" | "win" | "logo" => Ok("super"),
+        other => Err(anyhow!(
+            "unknown modifier {other:?}; use ctrl, shift, alt, or super"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn click(
     session: &Session,
     tool: &Tool,
@@ -72,19 +85,72 @@ pub async fn click(
     y: i32,
     button: u32,
     count: u32,
+    modifiers: &[String],
 ) -> Result<Value> {
-    let mut args = vec![
-        "mousemove".to_string(),
-        x.to_string(),
-        y.to_string(),
-        "click".to_string(),
-    ];
+    let mut args = vec!["mousemove".to_string(), x.to_string(), y.to_string()];
+    let mut held = Vec::new();
+    for modifier in modifiers {
+        let key = modifier_key(modifier)?;
+        args.push("keydown".into());
+        args.push(key.to_string());
+        held.push(key);
+    }
+    args.push("click".into());
     if count > 1 {
         args.push("--repeat".into());
         args.push(count.to_string());
     }
     args.push(button.to_string());
+    for key in held.iter().rev() {
+        args.push("keyup".into());
+        args.push((*key).to_string());
+    }
     run(session, tool, "click", &args).await
+}
+
+/// Press or release one mouse button, optionally moving first.  Holding a
+/// button across calls enables drag-selection and games where `drag` is too
+/// coarse.
+pub async fn mouse_button(
+    session: &Session,
+    tool: &Tool,
+    at: Option<(i32, i32)>,
+    button: u32,
+    down: bool,
+) -> Result<Value> {
+    let mut args = Vec::new();
+    if let Some((x, y)) = at {
+        args.push("mousemove".into());
+        args.push(x.to_string());
+        args.push(y.to_string());
+    }
+    args.push(if down { "mousedown" } else { "mouseup" }.into());
+    args.push(button.to_string());
+    run(
+        session,
+        tool,
+        if down { "mouse_down" } else { "mouse_up" },
+        &args,
+    )
+    .await
+}
+
+/// Hold or release a key or modifier across calls.
+pub async fn key_hold(session: &Session, tool: &Tool, combo: &str, down: bool) -> Result<Value> {
+    if combo.trim().is_empty() {
+        return Err(anyhow!("key must not be empty"));
+    }
+    let args = vec![
+        if down { "keydown" } else { "keyup" }.to_string(),
+        combo.trim().to_string(),
+    ];
+    run(
+        session,
+        tool,
+        if down { "key_down" } else { "key_up" },
+        &args,
+    )
+    .await
 }
 
 pub async fn move_to(session: &Session, tool: &Tool, x: i32, y: i32) -> Result<Value> {

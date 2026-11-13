@@ -3,7 +3,7 @@
 use crate::display::{DisplayManager, Session};
 use crate::env::Tool;
 use crate::mcp::CallResult;
-use crate::{a11y, clipboard, input, proc, screenshot, wait, windows, x11};
+use crate::{a11y, clipboard, input, proc, randr, screenshot, trace, wait, windows, x11};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
@@ -27,13 +27,14 @@ pub fn definitions() -> Vec<Value> {
     vec![
         tool(
             "display_start",
-            "Start a private, disposable nested X desktop for GUI testing, screenshots, mouse/keyboard automation, and window management. Call this before any other xephyr-mcp tool. visible=true launches Xephyr (a watchable window) on the host X11/XWayland display; visible=false launches headless Xvfb. Also starts a window manager and private D-Bus/AT-SPI buses so launched apps cannot reach the host session bus. Each server process owns one display: call display_stop before starting another, or run separate server instances with distinct session_id values for parallel desktops. Returns display, pids, dbus_address, runtime/log dirs, and accessibility status.",
+            "Start a private, disposable nested X desktop for GUI testing, screenshots, mouse/keyboard automation, and window management. Call this before any other xephyr-mcp tool. visible=true launches Xephyr (a watchable window) on the host X11/XWayland display; visible=false launches headless Xvfb. Also starts a window manager and private D-Bus/AT-SPI buses so launched apps cannot reach the host session bus. Each server process owns one display: call display_stop before starting another, or run separate server instances with distinct session_id values for parallel desktops. Returns display, pids, dbus_address, runtime/log/home dirs, trace path, and accessibility status.",
             schema(
                 json!({
                     "width": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Screen width in pixels (default 1280)" },
                     "height": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Screen height in pixels (default 800)" },
                     "visible": { "type": "boolean", "description": "Xephyr window (true, default) or headless Xvfb (false)" },
-                    "session_id": { "type": "string", "description": "Optional caller-supplied identifier (1-64 letters/digits/-_.). Used by the viewer and to keep multiple server instances apart. Generated if omitted." }
+                    "session_id": { "type": "string", "description": "Optional caller-supplied identifier (1-64 letters/digits/-_.). Used by the viewer and to keep multiple server instances apart. Generated if omitted." },
+                    "persist_home": { "type": "boolean", "description": "Keep HOME and XDG directories under the state dir keyed by session_id, so app profiles survive display_stop/display_start (default false)" }
                 }),
                 &[],
             ),
@@ -56,7 +57,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "screenshot",
-            "Capture the nested desktop as a PNG. Without options this captures the full root window downscaled to max_width/max_height; set region or window_id to crop at native resolution, and cursor/grid to overlay the pointer or a 100 px coordinate grid. The text block reports display/image dimensions, crop origin, and scale, so image coordinates can be converted back to display pixels.",
+            "Capture the nested desktop as a PNG. Without options this captures the full root window downscaled to max_width/max_height; set region or window_id to crop at native resolution, and cursor/grid/marks to overlay the pointer, a 100 px grid, or numbered accessibility targets. Marks also records the mapping so click(mark=N) can target an element. The text block reports display/image dimensions, crop origin, scale, and the mark list.",
             schema(
                 json!({
                     "max_width": { "type": "integer", "minimum": 64, "maximum": 4096, "description": "Maximum returned image width (default 1280; ignored with native=true)" },
@@ -76,6 +77,8 @@ pub fn definitions() -> Vec<Value> {
                     "window_id": { "description": "Capture this window instead of the root (id from list_windows)", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
                     "cursor": { "type": "boolean", "description": "Overlay the nested pointer using XFixes (default false)" },
                     "grid": { "type": "boolean", "description": "Overlay a 100 px coordinate grid (default false)" },
+                    "marks": { "type": "boolean", "description": "Draw numbered boxes around actionable accessibility elements and record their centers for click(mark=N) (default false)" },
+                    "mark_limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Maximum numbered elements when marks=true (default 60)" },
                     "native": { "type": "boolean", "description": "Skip downscaling and return full-resolution pixels (default false)" }
                 }),
                 &[],
@@ -138,15 +141,61 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "click",
-            "Move the nested pointer to (x, y) in display pixels and click. Uses XTEST on the nested X server; the host cursor is untouched. Call focus_window first when the target window is not focused.",
+            "Move the nested pointer and click. Pass x/y in display pixels, or mark from the last screenshot with marks=true. count>1 gives double/triple clicks; modifiers holds ctrl/shift/alt/super for the click. Uses XTEST on the nested server; the host cursor is untouched. Call focus_window first when the target window is not focused.",
             schema(
                 json!({
-                    "x": { "type": "integer", "description": "Display X coordinate" },
-                    "y": { "type": "integer", "description": "Display Y coordinate" },
+                    "x": { "type": "integer", "description": "Display X coordinate (omit when using mark)" },
+                    "y": { "type": "integer", "description": "Display Y coordinate (omit when using mark)" },
+                    "mark": { "type": "integer", "minimum": 1, "maximum": 999, "description": "Target the center of this numbered element from the last marks screenshot" },
                     "button": { "description": "left (default), middle, right, or a button number", "oneOf": [{ "type": "string" }, { "type": "integer" }] },
-                    "count": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Click count (default 1)" }
+                    "count": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Click count (default 1)" },
+                    "modifiers": { "type": "array", "items": { "type": "string", "enum": ["ctrl", "control", "shift", "alt", "super", "meta"] }, "description": "Modifiers held during the click" }
                 }),
-                &["x", "y"],
+                &[],
+            ),
+        ),
+        tool(
+            "mouse_down",
+            "Press and hold a mouse button, optionally moving to x/y first. Pair with mouse_up for drag-selection, canvas drawing, or games where a single drag call is too coarse.",
+            schema(
+                json!({
+                    "x": { "type": "integer", "description": "Optional display X to move to first" },
+                    "y": { "type": "integer", "description": "Optional display Y to move to first" },
+                    "button": { "description": "left (default), middle, right, or a button number", "oneOf": [{ "type": "string" }, { "type": "integer" }] }
+                }),
+                &[],
+            ),
+        ),
+        tool(
+            "mouse_up",
+            "Release a mouse button, optionally after moving to x/y. Completes a mouse_down sequence.",
+            schema(
+                json!({
+                    "x": { "type": "integer", "description": "Optional display X to move to first" },
+                    "y": { "type": "integer", "description": "Optional display Y to move to first" },
+                    "button": { "description": "left (default), middle, right, or a button number", "oneOf": [{ "type": "string" }, { "type": "integer" }] }
+                }),
+                &[],
+            ),
+        ),
+        tool(
+            "key_down",
+            "Press and hold a key or modifier (e.g. 'ctrl', 'shift', 'a'). Pair with key_up for modifier-held clicks or multi-step shortcuts. Use key for complete combos.",
+            schema(
+                json!({
+                    "key": { "type": "string", "description": "Key or modifier to hold" }
+                }),
+                &["key"],
+            ),
+        ),
+        tool(
+            "key_up",
+            "Release a key or modifier previously pressed with key_down.",
+            schema(
+                json!({
+                    "key": { "type": "string", "description": "Key or modifier to release" }
+                }),
+                &["key"],
             ),
         ),
         tool(
@@ -266,6 +315,40 @@ pub fn definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "window_state",
+            "Change a window's EWMH state: minimize, maximize, unmaximize, restore, fullscreen, unfullscreen, raise, lower, set_always_on_top, or clear_always_on_top. Pass action=state to read the current state without changing anything. Returns the applied action, final state names, geometry, and mapped/focused flags.",
+            schema(
+                json!({
+                    "id": { "description": "Window id (decimal or 0x hex)", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
+                    "action": { "type": "string", "enum": ["minimize", "maximize", "unmaximize", "restore", "fullscreen", "unfullscreen", "raise", "lower", "set_always_on_top", "clear_always_on_top", "state"], "description": "State change to apply, or state to query" }
+                }),
+                &["id", "action"],
+            ),
+        ),
+        tool(
+            "resize_display",
+            "Resize the nested desktop at runtime with RandR. Xephyr offers common modes (1600x1200, 1400x1050, 1280x1024, 1024x768, 800x600, 640x480, ...); Xvfb only offers its startup size. Changes the root geometry immediately and updates the viewer/state file.",
+            schema(
+                json!({
+                    "width": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "New display width" },
+                    "height": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "New display height" },
+                    "refresh": { "type": "number", "description": "Preferred refresh rate when several modes match (optional)" }
+                }),
+                &["width", "height"],
+            ),
+        ),
+        tool(
+            "trace_tail",
+            "Read the append-only JSONL tool trace for a session (or the newest trace when session_id is omitted). Each line records tool, sanitized arguments, duration, ok/error, and before/after frame hashes for screen-changing tools. Traces survive display_stop.",
+            schema(
+                json!({
+                    "session_id": { "type": "string", "description": "Session trace to read (default: newest trace file)" },
+                    "lines": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Trailing lines (default 100)" }
+                }),
+                &[],
+            ),
+        ),
+        tool(
             "list_processes",
             "List processes belonging to the nested desktop (matched by their private XDG_RUNTIME_DIR), with pid, ppid, pgid, command line, and whether the process was started by launch. Use this to find a PID for kill_process or wait_for process_exit.",
             schema(json!({}), &[]),
@@ -295,11 +378,14 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "a11y_find",
-            "Query the AT-SPI tree by name and/or role and return only matching nodes (with actions, states, and geometry). Cheaper than a full a11y_tree dump on large applications. Use the returned index with a11y_click, a11y_focus, or a11y_set_text.",
+            "Query the AT-SPI tree by name, role, state, and/or action and return only matching nodes (with actions, states, and geometry). Cheaper than a full a11y_tree dump on large applications. Use path to search inside a subtree, and the returned index with a11y_click, a11y_focus, or a11y_set_text.",
             schema(
                 json!({
                     "name": { "type": "string", "description": "Accessible name substring (or exact match with exact=true)" },
                     "role": { "type": "string", "description": "Role filter, e.g. 'push button', 'entry', 'menu item'" },
+                    "state": { "type": "string", "description": "Comma-separated required states: enabled, focused, visible, showing, sensitive, checked, selected" },
+                    "action": { "type": "string", "description": "Action-name substring, e.g. 'click', 'activate', 'toggle'" },
+                    "path": { "type": "string", "description": "Only search this node's subtree (path from a11y_tree/a11y_find)" },
                     "exact": { "type": "boolean", "description": "Require an exact name match (default false)" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum nodes to return (default 20)" },
                     "max_depth": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Tree depth (default 12)" },
@@ -335,12 +421,13 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "a11y_tree",
-            "Read the AT-SPI accessibility tree of the nested desktop: roles, names, actions, states, and screen rectangles. Much cheaper and more precise than screenshots for forms, buttons and menus. Requires GTK/Qt accessibility to be enabled (it is for launched apps) and PyGObject.",
+            "Read the AT-SPI accessibility tree of the nested desktop: roles, names, actions, states, and screen rectangles. Much cheaper and more precise than screenshots for forms, buttons and menus. Pass path to dump only one subtree instead of the whole desktop. Requires GTK/Qt accessibility to be enabled (it is for launched apps) and PyGObject.",
             schema(
                 json!({
                     "max_depth": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Tree depth (default 12)" },
                     "max_nodes": { "type": "integer", "minimum": 1, "maximum": 4000, "description": "Node budget (default 400)" },
-                    "app": { "type": "string", "description": "Only include applications whose name contains this string" }
+                    "app": { "type": "string", "description": "Only include applications whose name contains this string" },
+                    "path": { "type": "string", "description": "Dump this node's subtree (path from a11y_tree/a11y_find)" }
                 }),
                 &[],
             ),
@@ -352,14 +439,15 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "a11y_click",
-            "Find an accessible by name (case-insensitive; exact matches win), optionally filtered by role, and invoke its first action. If the node has no action, click its center with XTEST. Returns the matched node and how it was activated.",
+            "Activate an accessible element by name or by tree path. Invokes its click/press/activate/toggle action; if it has none, clicks its center with XTEST on non-GTK4 toolkits. Path targeting is the reliable option for GTK4 widgets, whose child positions are unreliable. Returns the matched node and how it was activated.",
             schema(
                 json!({
                     "name": { "type": "string", "description": "Accessible name (button label, menu item, field label, ...)" },
+                    "path": { "type": "string", "description": "Tree path from a11y_tree/a11y_find; bypasses name matching and geometry" },
                     "role": { "type": "string", "description": "Optional role filter, e.g. 'push button', 'menu item', 'check box'" },
                     "index": { "type": "integer", "minimum": 0, "maximum": 200, "description": "Pick the Nth best match (default 0)" }
                 }),
-                &["name"],
+                &[],
             ),
         ),
     ]
@@ -383,10 +471,63 @@ fn schema(properties: Value, required: &[&str]) -> Value {
 }
 
 pub async fn call(manager: &DisplayManager, name: &str, args: &Value) -> CallResult {
-    match dispatch(manager, name, args).await {
+    manager.begin_call();
+    let started = std::time::Instant::now();
+    let before_session = manager.session().await;
+    let hashed = trace::should_hash(name);
+    let before_hash = if hashed {
+        frame_hash(before_session.as_ref()).await
+    } else {
+        None
+    };
+
+    let outcome = dispatch(manager, name, args).await;
+    let after_session = manager.session().await;
+    let after_hash = if hashed {
+        frame_hash(after_session.as_ref()).await
+    } else {
+        None
+    };
+    let result = match outcome {
         Ok(result) => result,
         Err(err) => CallResult::error(format!("{err:#}")),
-    }
+    };
+
+    // Prefer the post-call session so display_start is recorded under the new
+    // session id; fall back to the pre-call one for display_stop.
+    let session = after_session.as_ref().or(before_session.as_ref());
+    let session_id = session.map(|session| session.info.session_id.as_str());
+    let display = session.map(|session| session.info.display.as_str());
+    let error = result
+        .is_error
+        .then(|| result.summary().unwrap_or("tool error"));
+    let entry = trace::entry(
+        name,
+        args,
+        session_id,
+        display,
+        started.elapsed().as_millis(),
+        !result.is_error,
+        error,
+        before_hash.as_deref(),
+        after_hash.as_deref(),
+    );
+    let _ = trace::append(&trace::path_for(session_id), entry);
+
+    manager.end_call();
+    result
+}
+
+async fn frame_hash(session: Option<&Arc<Session>>) -> Option<String> {
+    let display = session?.info.display.clone();
+    tokio::task::spawn_blocking(move || {
+        screenshot::capture(&display)
+            .map(|frame| format!("{:016x}", screenshot::hash(&frame)))
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<CallResult> {
@@ -396,7 +537,10 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             let height = opt_u64(args, "height").unwrap_or(800) as u32;
             let visible = opt_bool(args, "visible").unwrap_or(true);
             let session_id = opt_str(args, "session_id").map(str::to_string);
-            let report = manager.start(width, height, visible, session_id).await?;
+            let persist_home = opt_bool(args, "persist_home").unwrap_or(false);
+            let report = manager
+                .start(width, height, visible, session_id, persist_home)
+                .await?;
             Ok(CallResult::text(&report.to_json()))
         }
         "display_stop" => {
@@ -419,6 +563,8 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             };
             let cursor = opt_bool(args, "cursor").unwrap_or(false);
             let grid = opt_bool(args, "grid").unwrap_or(false);
+            let marks_requested = opt_bool(args, "marks").unwrap_or(false);
+            let mark_limit = opt_u64(args, "mark_limit").unwrap_or(60).clamp(1, 200) as u32;
             // Crops default to native resolution: downscaling a small region
             // is exactly what destroys text legibility.
             let native =
@@ -426,8 +572,8 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             let max_width = opt_u64(args, "max_width").unwrap_or(1280).clamp(64, 4096) as u32;
             let max_height = opt_u64(args, "max_height").unwrap_or(800).clamp(64, 4096) as u32;
             let display = session.info.display.clone();
-            let display_width = session.info.width;
-            let display_height = session.info.height;
+            let display_width = session.width();
+            let display_height = session.height();
             let kind = if window_id.is_some() {
                 "window"
             } else if region.is_some() {
@@ -435,6 +581,24 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             } else {
                 "root"
             };
+
+            let (marks_value, mark_list) = if marks_requested {
+                let (value, list) = a11y::marks(
+                    &session,
+                    manager.tools.python.as_ref(),
+                    mark_limit,
+                    14,
+                    1600,
+                )
+                .await?;
+                (Some(value), list)
+            } else {
+                (None, Vec::new())
+            };
+            let mark_boxes: Vec<(u32, i32, i32, u32, u32)> = mark_list
+                .iter()
+                .map(|mark| (mark.mark, mark.x, mark.y, mark.width, mark.height))
+                .collect();
 
             let (png, source_width, source_height, width, height, origin, cursor_method) =
                 tokio::task::spawn_blocking(move || -> Result<ScreenshotOutput> {
@@ -451,7 +615,11 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                     } else {
                         screenshot::capture(&display)?
                     };
-                    let origin = region.map(|region| (region.x as i32, region.y as i32));
+                    let origin = if let Some(window) = window_id {
+                        Some(screenshot::window_origin(&display, window)?)
+                    } else {
+                        region.map(|region| (region.x as i32, region.y as i32))
+                    };
                     let mut cursor_method = None;
                     if cursor {
                         let (ox, oy) = origin.unwrap_or((0, 0));
@@ -462,6 +630,10 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                     if grid {
                         let spacing = if frame.width < 500 { 50 } else { 100 };
                         screenshot::overlay_grid(&mut frame, spacing);
+                    }
+                    if !mark_boxes.is_empty() {
+                        let (ox, oy) = origin.unwrap_or((0, 0));
+                        screenshot::draw_marks(&mut frame, &mark_boxes, ox, oy);
                     }
                     let source_width = frame.width;
                     let source_height = frame.height;
@@ -485,6 +657,9 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                 .await
                 .context("screenshot task failed")??;
 
+            if marks_requested {
+                session.set_marks(mark_list);
+            }
             let origin_x = origin.map(|(x, _)| x).unwrap_or(0);
             let origin_y = origin.map(|(_, y)| y).unwrap_or(0);
             let metadata = json!({
@@ -510,6 +685,18 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                 "cursor_drawn": cursor_method.is_some(),
                 "cursor_method": cursor_method.map(|method| format!("{method:?}").to_lowercase()),
                 "grid_overlay": grid,
+                "marks_requested": marks_requested,
+                "mark_count": mark_list_count(&marks_value),
+                "marks": marks_value
+                    .as_ref()
+                    .and_then(|value| value.get("marks"))
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                "marks_geometry_note": marks_value
+                    .as_ref()
+                    .and_then(|value| value.get("geometry_note"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
                 "coordinate_space": "display",
                 "note": "Input coordinates are display pixels. For coordinates measured on this image, divide by scale and add origin_x/origin_y.",
             });
@@ -518,12 +705,114 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         "click" => {
             let session = active(manager).await?;
             let tool = xdotool(manager)?;
-            let x = required_i64(args, "x")? as i32;
-            let y = required_i64(args, "y")? as i32;
             let button = button_arg(args)?;
             let count = opt_u64(args, "count").unwrap_or(1).clamp(1, 20) as u32;
+            let modifiers = args
+                .get("modifiers")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let target = opt_u64(args, "mark")
+                .map(|mark| {
+                    session
+                        .marks()
+                        .into_iter()
+                        .find(|item| u64::from(item.mark) == mark)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "mark {mark} is not in the last set-of-marks screenshot; call screenshot with marks=true first"
+                            )
+                        })
+                })
+                .transpose()?;
+
+            if let Some(mark) = &target {
+                // GTK4 reports unreliable child positions, so prefer semantic
+                // accessibility actions for marked elements.
+                let role = mark.role.to_ascii_lowercase();
+                let text_role =
+                    role.contains("text") || role.contains("entry") || role.contains("password");
+                let actionable = mark.actions.iter().any(|action| {
+                    let action = action.to_ascii_lowercase();
+                    let words: &[&str] = if text_role {
+                        &["click", "press", "toggle"]
+                    } else {
+                        &["click", "press", "activate", "toggle"]
+                    };
+                    words.iter().any(|word| action.contains(word))
+                });
+                let plain_left = button == 1 && count == 1 && modifiers.is_empty();
+                if plain_left {
+                    if let Some(python) = manager.tools.python.as_ref() {
+                        // Clicking an entry means "focus it", not "activate
+                        // the default button".
+                        if text_role && !mark.name.is_empty() {
+                            let mut result = a11y::focus(
+                                &session,
+                                Some(python),
+                                Some(&mark.name),
+                                Some(&mark.role),
+                                0,
+                            )
+                            .await?;
+                            if result.get("focused").and_then(Value::as_bool) == Some(true) {
+                                result["mark"] = json!(mark.mark);
+                                result["via"] = json!("mark/focus");
+                                return Ok(CallResult::text(&result));
+                            }
+                        }
+                        if actionable && !mark.path.is_empty() {
+                            let mut result =
+                                a11y::click_path(&session, Some(python), &mark.path).await?;
+                            if result.get("did_action").and_then(Value::as_bool) == Some(true) {
+                                result["mark"] = json!(mark.mark);
+                                result["via"] = json!("mark/a11y");
+                                return Ok(CallResult::text(&result));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let (x, y) = match &target {
+                Some(mark) => mark.center(),
+                None => (
+                    required_i64(args, "x")? as i32,
+                    required_i64(args, "y")? as i32,
+                ),
+            };
+            let mut result = input::click(&session, &tool, x, y, button, count, &modifiers).await?;
+            if let Some(mark) = &target {
+                result["mark"] = json!(mark.mark);
+                result["via"] = json!("mark/xtest");
+            }
+            Ok(CallResult::text(&result))
+        }
+        "mouse_down" | "mouse_up" => {
+            let session = active(manager).await?;
+            let tool = xdotool(manager)?;
+            let button = button_arg(args)?;
+            let at = match (opt_i64(args, "x"), opt_i64(args, "y")) {
+                (Some(x), Some(y)) => Some((x as i32, y as i32)),
+                (None, None) => None,
+                _ => return Err(anyhow!("mouse_down/mouse_up need both x and y, or neither")),
+            };
             Ok(CallResult::text(
-                &input::click(&session, &tool, x, y, button, count).await?,
+                &input::mouse_button(&session, &tool, at, button, name == "mouse_down").await?,
+            ))
+        }
+        "key_down" | "key_up" => {
+            let session = active(manager).await?;
+            let tool = xdotool(manager)?;
+            let combo = required_str(args, "key")?;
+            Ok(CallResult::text(
+                &input::key_hold(&session, &tool, combo, name == "key_down").await?,
             ))
         }
         "move" => {
@@ -770,14 +1059,27 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             let session = active(manager).await?;
             let name = opt_str(args, "name");
             let role = opt_str(args, "role");
-            if name.is_none() && role.is_none() {
-                return Err(anyhow!("a11y_find needs 'name' or 'role'"));
+            let state = opt_str(args, "state");
+            let action = opt_str(args, "action");
+            let path = opt_str(args, "path");
+            if name.is_none()
+                && role.is_none()
+                && state.is_none()
+                && action.is_none()
+                && path.is_none()
+            {
+                return Err(anyhow!(
+                    "a11y_find needs at least one of 'name', 'role', 'state', 'action', or 'path'"
+                ));
             }
             let result = a11y::find(
                 &session,
                 manager.tools.python.as_ref(),
                 name,
                 role,
+                state,
+                action,
+                path,
                 opt_bool(args, "exact").unwrap_or(false),
                 opt_u64(args, "limit").unwrap_or(20) as u32,
                 opt_u64(args, "max_depth").unwrap_or(12) as u32,
@@ -872,25 +1174,85 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                 .context("close task failed")??;
             Ok(CallResult::text(&result))
         }
+        "window_state" => {
+            let session = active(manager).await?;
+            let id = x11::parse_window_id(args.get("id").unwrap_or(&Value::Null))?;
+            let action = required_str(args, "action")?.to_string();
+            let display = session.info.display.clone();
+            let result =
+                tokio::task::spawn_blocking(move || windows::action(&display, id, &action))
+                    .await
+                    .context("window state task failed")??;
+            Ok(CallResult::text(&result))
+        }
+        "resize_display" => {
+            let session = active(manager).await?;
+            let width = opt_u64(args, "width")
+                .ok_or_else(|| anyhow!("missing width"))?
+                .clamp(64, 8192) as u16;
+            let height = opt_u64(args, "height")
+                .ok_or_else(|| anyhow!("missing height"))?
+                .clamp(64, 8192) as u16;
+            let refresh = args
+                .get("refresh")
+                .and_then(Value::as_f64)
+                .map(|v| v as f32);
+            let display = session.info.display.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                randr::resize(&display, width, height, refresh)
+            })
+            .await
+            .context("resize task failed")??;
+            session
+                .set_size(u32::from(width), u32::from(height))
+                .context("display resized but the state file could not be updated")?;
+            Ok(CallResult::text(&result))
+        }
+        "trace_tail" => {
+            let session_id = match opt_str(args, "session_id") {
+                Some(id) => Some(id.to_string()),
+                None => manager
+                    .session()
+                    .await
+                    .map(|session| session.info.session_id.clone()),
+            };
+            let lines = opt_u64(args, "lines").unwrap_or(100).clamp(1, 2000) as usize;
+            let (file, text) =
+                tokio::task::spawn_blocking(move || trace::read_tail(session_id.as_deref(), lines))
+                    .await
+                    .context("trace read task failed")??;
+            Ok(CallResult::text(&json!({
+                "file": file.display().to_string(),
+                "requested_lines": lines,
+                "lines": text.lines().count(),
+                "text": text,
+            })))
+        }
         "a11y_tree" => {
             let session = active(manager).await?;
             let max_depth = opt_u64(args, "max_depth").unwrap_or(12) as u32;
             let max_nodes = opt_u64(args, "max_nodes").unwrap_or(400) as u32;
             let app = opt_str(args, "app");
+            let path = opt_str(args, "path");
             let result = a11y::tree(
                 &session,
                 manager.tools.python.as_ref(),
                 max_depth,
                 max_nodes,
                 app,
+                path,
             )
             .await?;
             Ok(CallResult::text(&result))
         }
         "a11y_click" => {
             let session = active(manager).await?;
-            let name = required_str(args, "name")?;
+            let name = opt_str(args, "name");
             let role = opt_str(args, "role");
+            let path = opt_str(args, "path");
+            if name.is_none() && path.is_none() {
+                return Err(anyhow!("a11y_click needs 'name' or 'path'"));
+            }
             let index = opt_u64(args, "index").unwrap_or(0) as u32;
             let result = a11y::click(
                 &session,
@@ -898,6 +1260,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                 manager.tools.xdotool.as_ref(),
                 name,
                 role,
+                path,
                 index,
             )
             .await?;
@@ -1108,12 +1471,15 @@ async fn diagnose(manager: &DisplayManager) -> Value {
             "session_id": session.info.session_id,
             "display": session.info.display,
             "display_reachable": x11::connect(&session.info.display).is_ok(),
-            "width": session.info.width,
-            "height": session.info.height,
+            "width": session.width(),
+            "height": session.height(),
             "visible": session.info.visible,
             "a11y_ready": session.info.a11y_ready,
             "runtime_dir": session.info.runtime_dir.display().to_string(),
             "log_dir": session.info.log_dir.display().to_string(),
+            "home": session.info.home.as_ref().map(|path| path.display().to_string()),
+            "persistent_home": session.info.persistent_home,
+            "trace": trace::session_path(&session.info.session_id).display().to_string(),
             "launched": session.launch_count(),
         })
     });
@@ -1127,6 +1493,10 @@ async fn diagnose(manager: &DisplayManager) -> Value {
             .as_ref()
             .map(|path| path.display().to_string()),
         "state_dir": crate::env::shared_runtime_dir().display().to_string(),
+        "trace_dir": trace::traces_dir().display().to_string(),
+        "homes_dir": crate::env::shared_runtime_dir().join("homes").display().to_string(),
+        "idle_timeout_secs": manager.idle_timeout.map(|value| value.as_secs()),
+        "max_lifetime_secs": manager.max_lifetime.map(|value| value.as_secs()),
         "python_atspi": gi,
         "active_session": active,
         "sessions_on_host": crate::state::list_sessions().len(),
@@ -1137,6 +1507,8 @@ async fn diagnose(manager: &DisplayManager) -> Value {
             "X servers do not implement -version; their path identifies the bundled build.",
             "The nested desktop is X11-only; the host may be Wayland through XWayland.",
             "AT-SPI requires PyGObject in the python3 environment (python_atspi).",
+            "XEPHYR_MCP_IDLE_TIMEOUT_SECS and XEPHYR_MCP_MAX_LIFETIME_SECS enable the auto-teardown watchdog.",
+            "Set persist_home=true to keep app profiles across display_stop/display_start with the same session_id.",
         ],
     })
 }
@@ -1185,6 +1557,15 @@ async fn command_ok(path: &std::path::Path, extra: &[(String, String)], args: &[
         .await
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn mark_list_count(value: &Option<Value>) -> usize {
+    value
+        .as_ref()
+        .and_then(|value| value.get("marks"))
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0)
 }
 
 fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {

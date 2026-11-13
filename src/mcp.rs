@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 /// Agent-facing guidance returned in the MCP `initialize` response.
-pub const INSTRUCTIONS: &str = "Use xephyr-mcp for GUI and desktop testing on a private, disposable X desktop: screenshots, mouse/keyboard input, window management, and accessibility-driven UI automation. Nothing here touches the host desktop, host cursor, or host session bus.\n\nTypical flow: display_start -> launch -> screenshot/list_windows -> click/type/key -> display_stop. Call display_start first; if a tool says no display is running, start one. Use visible=false for headless Xvfb or visible=true for a watchable Xephyr window. Screenshots may be downscaled: use the returned scale to convert image coordinates back to display pixels for input. Prefer a11y_find/a11y_click over pixels for forms, buttons, and menus.\n\nAfter an action that changes the UI, call wait_for_idle before the next screenshot or click instead of polling. Use wait_for to block on a window title/class, a process exit, a screen-stable state, a changed region, or a file. Use screenshot region/window_id for legible native-resolution crops, clipboard_set/clipboard_get for long or Unicode text, and list_processes/tail_log when an app fails to start. Call diagnose first when an environmental tool is missing.\n\nEach server process owns one display and can run several sessions via session_id. A host-side viewer can watch them: 'xephyr-mcp-viewer --session ID', or '--layout bsp' to tile every live session. Call display_stop when finished; it reaps every launched process group, the window manager, the X server, and the private D-Bus/AT-SPI buses.";
+pub const INSTRUCTIONS: &str = "Use xephyr-mcp for GUI and desktop testing on a private, disposable X desktop: screenshots, mouse/keyboard input, window management, and accessibility-driven UI automation. Nothing here touches the host desktop, host cursor, or host session bus.\n\nTypical flow: display_start -> launch -> screenshot/list_windows -> click/type/key -> display_stop. Call display_start first; if a tool says no display is running, start one. Use visible=false for headless Xvfb or visible=true for a watchable Xephyr window. Screenshots may be downscaled: use the returned scale to convert image coordinates back to display pixels for input. Prefer a11y_find/a11y_click over pixels for forms, buttons, and menus.\n\nAfter an action that changes the UI, call wait_for_idle before the next screenshot or click instead of polling. Use wait_for to block on a window title/class, a process exit, a screen-stable state, a changed region, or a file. Use screenshot region/window_id for legible native-resolution crops, clipboard_set/clipboard_get for long or Unicode text, and list_processes/tail_log when an app fails to start. Call diagnose first when an environmental tool is missing. For repeated clicks use count; hold ctrl/shift/alt with modifiers; use mouse_down/mouse_up and key_down/key_up for state that spans calls. window_state changes minimize/maximize/fullscreen/always-on-top; resize_display works on Xephyr. screenshot marks=true numbers actionable elements and click(mark=N) activates them through accessibility when possible. Every call is traced; use trace_tail to review what happened. display_start persist_home=true keeps app profiles, and XEPHYR_MCP_IDLE_TIMEOUT_SECS enables auto-teardown.\n\nEach server process owns one display and can run several sessions via session_id. A host-side viewer can watch them: 'xephyr-mcp-viewer --session ID', or '--layout bsp' to tile every live session. Call display_stop when finished; it reaps every launched process group, the window manager, the X server, and the private D-Bus/AT-SPI buses.";
 
 pub enum Content {
     Text(String),
@@ -68,6 +68,14 @@ impl CallResult {
             content: vec![Content::Text(message.into())],
             is_error: true,
         }
+    }
+
+    /// First text block, used for trace error messages.
+    pub fn summary(&self) -> Option<&str> {
+        self.content.iter().find_map(|item| match item {
+            Content::Text(text) => Some(text.as_str()),
+            Content::Image { .. } => None,
+        })
     }
 
     /// Convert to rmcp's typed tool result.  Tool-level failures stay in the
@@ -159,13 +167,53 @@ fn tool_from_json(value: Value) -> Tool {
 
 pub async fn serve(manager: Arc<DisplayManager>) -> Result<()> {
     eprintln!("[xephyr-mcp] server ready (v{})", env!("CARGO_PKG_VERSION"));
+    let watchdog = tokio::spawn(watchdog(manager.clone()));
     let running = rmcp::serve_server(XephyrServer::new(manager), stdio())
         .await
         .map_err(|err| anyhow::anyhow!("MCP initialization failed: {err}"))?;
-    running
-        .waiting()
-        .await
-        .map_err(|err| anyhow::anyhow!("MCP server task failed: {err}"))?;
+    let outcome = running.waiting().await;
+    watchdog.abort();
+    outcome.map_err(|err| anyhow::anyhow!("MCP server task failed: {err}"))?;
     eprintln!("[xephyr-mcp] stdin closed, shutting down");
     Ok(())
+}
+
+/// Stop a desktop left running by a dead or hung client.  Stdio EOF covers the
+/// normal case; this covers a client that stays connected but never sends
+/// display_stop, or a session that exceeds its configured lifetime.
+async fn watchdog(manager: Arc<DisplayManager>) {
+    if manager.idle_timeout.is_none() && manager.max_lifetime.is_none() {
+        return;
+    }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let Some(session) = manager.session().await else {
+            continue;
+        };
+        let running_for = std::time::Duration::from_secs(
+            crate::state::now().saturating_sub(session.info.started_at),
+        );
+        if let Some(reason) = manager.should_auto_stop(running_for) {
+            eprintln!(
+                "[xephyr-mcp] watchdog: stopping {} ({reason})",
+                session.info.display
+            );
+            let path = crate::trace::path_for(Some(&session.info.session_id));
+            let entry = crate::trace::entry(
+                "watchdog",
+                &json!({ "reason": reason }),
+                Some(&session.info.session_id),
+                Some(&session.info.display),
+                0,
+                true,
+                None,
+                None,
+                None,
+            );
+            let _ = crate::trace::append(&path, entry);
+            if let Err(err) = manager.stop().await {
+                eprintln!("[xephyr-mcp] watchdog stop failed: {err:#}");
+            }
+        }
+    }
 }

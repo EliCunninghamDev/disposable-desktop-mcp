@@ -27,7 +27,7 @@ tokio = { version = "1", features = [
     "time",
     "signal",
 ] }
-x11rb = { version = "0.13", features = ["xfixes"] }
+x11rb = { version = "0.13", features = ["randr", "xfixes"] }
 
 [profile.release]
 lto = "thin"

@@ -77,13 +77,11 @@ def text(value):
     return str(value)
 
 
-def extents(node):
-    """Return [x, y, w, h] in screen coordinates, or None."""
-    value = safe(lambda: node.get_extents(Atspi.CoordType.SCREEN))
-    if value is None:
-        return None
+def rect_from(value):
     # GI returns an Atspi.Rect object on current at-spi2-core; older bindings
     # returned a 4/5-tuple.
+    if value is None:
+        return None
     for attr in ("x", "y", "width", "height"):
         if hasattr(value, attr):
             rect = [int(getattr(value, attr)) for attr in ("x", "y", "width", "height")]
@@ -98,12 +96,27 @@ def extents(node):
     return None
 
 
+def extents(node):
+    """Return ([x, y, w, h], coordinate kind).
+
+    GTK4 returns (0, 0) for SCREEN but meaningful window-local coordinates for
+    WINDOW, so prefer WINDOW and let absolutize() add the X11 window origin.
+    """
+    rect = rect_from(safe(lambda: node.get_extents(Atspi.CoordType.WINDOW)))
+    if rect:
+        return rect, "window"
+    rect = rect_from(safe(lambda: node.get_extents(Atspi.CoordType.SCREEN)))
+    if rect:
+        return rect, "screen"
+    return None, None
+
+
 def states(node):
     state_set = safe(lambda: node.get_state_set())
     if state_set is None:
         return {}
     out = {}
-    for name in ("enabled", "focused", "visible", "showing", "sensitive"):
+    for name in ("enabled", "focused", "visible", "showing", "sensitive", "checked", "selected"):
         constant = getattr(Atspi.StateType, name.upper(), None)
         out[name] = bool(constant is not None and safe(lambda: state_set.contains(constant), False))
     return out
@@ -121,7 +134,7 @@ def actions(node):
 def node_record(node, path, app_name, depth):
     flags = states(node)
     names = actions(node)
-    rect = extents(node)
+    rect, coord = extents(node)
     toolkit = text(safe(lambda: node.get_toolkit_name(), ""))
     toolkit_version = text(safe(lambda: node.get_toolkit_version(), ""))
     role = text(safe(lambda: node.get_role_name(), ""))
@@ -147,7 +160,10 @@ def node_record(node, path, app_name, depth):
         "focused": flags.get("focused", False),
         "visible": flags.get("visible", False),
         "showing": flags.get("showing", False),
+        "coord": coord,
         "sensitive": flags.get("sensitive", False),
+        "checked": flags.get("checked", False),
+        "selected": flags.get("selected", False),
     }
     if rect:
         record["x"], record["y"], record["width"], record["height"] = rect
@@ -173,22 +189,37 @@ def walk(desktop, options, visitor):
     app_count = getattr(desktop, "get_child_count", lambda: 0)()
     nodes = []
 
-    for app_index in range(min(app_count, 128)):
-        app = safe(lambda i=app_index: desktop.get_child_at_index(i))
-        if app is None:
-            continue
-        app_name = text(safe(lambda: app.get_name(), ""))
-        if app_filter and app_filter not in app_name.lower():
-            continue
-        stack = [(app, str(app_index), 0, "")]
+    root_path = (options.get("path") or "").strip()
+    apps = []
+    if root_path:
+        root_node = resolve_target(desktop, {"path": root_path})
+        if root_node is None:
+            return nodes, app_count
+        app_index = int(root_path.split(".")[0])
+        app = safe(lambda: desktop.get_child_at_index(app_index))
+        app_name = text(safe(lambda: app.get_name(), "")) if app is not None else ""
+        apps = [(root_node, root_path, app_name)]
+    else:
+        for app_index in range(min(app_count, 128)):
+            app = safe(lambda i=app_index: desktop.get_child_at_index(i))
+            if app is None:
+                continue
+            app_name = text(safe(lambda: app.get_name(), ""))
+            if app_filter and app_filter not in app_name.lower():
+                continue
+            apps.append((app, str(app_index), app_name))
+
+    for app, start_path, app_name in apps:
+        stack = [(app, start_path, 0, "")]
         while stack:
             if time.monotonic() - started > TIMEOUT_SECONDS or len(nodes) >= max_nodes:
                 return nodes, app_count
             node, path, depth, window_name = stack.pop()
             record = node_record(node, path, app_name, depth)
-            next_window = window_name
-            if depth >= 1 and record["role"].lower() in ("frame", "dialog", "window", "alert"):
+            if record["role"].lower() in ("frame", "dialog", "window", "alert"):
                 next_window = record["name"] or window_name
+            else:
+                next_window = window_name
             record["window"] = next_window
             keep = bool(record["name"] or record["actions"] or record["focused"])
             keep = keep or record["role"] in ("application", "frame", "dialog", "window", "alert")
@@ -235,10 +266,10 @@ def window_rect(name):
 
 
 def absolutize(nodes):
-    """GTK4 reports window-local rectangles; convert them to screen space.
+    """Convert window-local accessibility rectangles to screen space.
 
-    GTK3 and Qt report screen coordinates already, so only apps whose frame
-    rectangle is at (0, 0) with the X11 client's exact size are shifted.
+    The window origin comes from xdotool, which reports the X11 client origin.
+    Widgets with SCREEN coordinates are already absolute and are left alone.
     """
     frames = {}
     for node in nodes:
@@ -247,23 +278,15 @@ def absolutize(nodes):
             frames.setdefault(window, node)
 
     offsets = {}
-    for window, frame in frames.items():
+    for window in frames:
         rect = window_rect(window)
-        if rect is None:
-            continue
-        wx, wy, ww, wh = rect
-        local = (
-            abs(frame["x"]) <= 1
-            and abs(frame["y"]) <= 1
-            and abs((frame.get("width") or 0) - ww) <= 2
-            and abs((frame.get("height") or 0) - wh) <= 2
-        )
-        if local:
-            offsets[window] = (wx, wy)
-
+        if rect is not None:
+            offsets[window] = (rect[0], rect[1])
     if not offsets:
         return
     for node in nodes:
+        if node.get("coord") != "window":
+            continue
         offset = offsets.get(node.get("window") or "")
         if offset and node.get("x") is not None:
             node["x"] += offset[0]
@@ -284,9 +307,31 @@ def resolve_target(desktop, record):
     return target
 
 
+def state_filter(record, wanted):
+    """Match a comma-separated list of required boolean states."""
+    if not wanted:
+        return True
+    for name in [part.strip().lower() for part in wanted.split(",") if part.strip()]:
+        if name == "checked":
+            if not record.get("checked", False):
+                return False
+        elif not record.get(name, False):
+            return False
+    return True
+
+
+def action_filter(record, wanted):
+    if not wanted:
+        return True
+    wanted = wanted.lower()
+    return any(wanted in action.lower() for action in record.get("actions", []))
+
+
 def collect_matches(desktop, options, wanted, role_filter, exact=False):
-    """Score accessible nodes by name/role and return (matches, app_count)."""
+    """Score accessible nodes by name/role/state and return (matches, app_count)."""
     wanted_lower = (wanted or "").strip().lower()
+    wanted_state = (options.get("state") or "").strip()
+    wanted_action = (options.get("action") or "").strip()
     chosen = []
 
     def visit(record):
@@ -299,11 +344,15 @@ def collect_matches(desktop, options, wanted, role_filter, exact=False):
                     return
             elif name_lower != wanted_lower and wanted_lower not in name_lower:
                 return
-        elif not role_filter:
+        elif not (role_filter or wanted_state or wanted_action or (options.get("path") or "").strip()):
             return
         if role_filter:
             if not role_matches(record["role"], role_filter):
                 return
+        if not state_filter(record, wanted_state):
+            return
+        if not action_filter(record, wanted_action):
+            return
         clickish = any(
             any(word in action.lower() for word in ("click", "press", "activate", "toggle"))
             for action in record["actions"]
@@ -480,11 +529,115 @@ def main():
             "candidates": [item[1]["path"] for item in chosen[:8]],
         })
 
+    if command == "click_path":
+        path = (options.get("path") or "").strip()
+        if not path:
+            fail("click_path needs --path")
+        target = resolve_target(desktop, {"path": path})
+        if target is None:
+            emit({
+                "ok": True,
+                "found": False,
+                "did_action": False,
+                "path": path,
+                "error": "the accessibility node no longer exists",
+            })
+        record = node_record(target, path, "", 0)
+        action_count = safe(lambda: int(target.get_n_actions()), 0) or 0
+        names = [text(safe(lambda i=i: target.get_action_name(i), "")) for i in range(action_count)]
+        action_index = int(options.get("action", 0) or 0) if "action" in options else None
+        if action_index is None:
+            action_index = next(
+                (
+                    i
+                    for i, action_name in enumerate(names)
+                    if any(
+                        word in action_name.lower()
+                        for word in ("click", "press", "activate", "toggle")
+                    )
+                ),
+                None,
+            )
+        did_action = False
+        if action_index is not None and 0 <= action_index < action_count:
+            did_action = bool(safe(lambda: target.do_action(action_index), False))
+        emit({
+            "ok": True,
+            "found": True,
+            "did_action": did_action,
+            "action_index": action_index,
+            "action_count": action_count,
+            "actions": names,
+            "method": "atspi",
+            "node": record,
+        })
+
+    if command == "marks":
+        limit = max(1, min(int(options.get("limit", 80) or 80), 200))
+        options.setdefault("max_nodes", "1200")
+        nodes, app_count = walk(desktop, options, None)
+        absolutize(nodes)
+        actionable = []
+        seen = set()
+        for record in nodes:
+            role = record["role"].lower()
+            if record.get("x") is None or record.get("width") is None:
+                continue
+            if record["width"] < 4 or record["height"] < 4:
+                continue
+            if record["x"] < 0 or record["y"] < 0:
+                continue
+            if record["role"] in ("application", "frame", "dialog", "window", "alert"):
+                continue
+            if role in ("label", "static text", "caption", "paragraph", "heading"):
+                continue
+            clickish = any(
+                any(word in action.lower() for word in ("click", "press", "activate", "toggle"))
+                for action in record["actions"]
+            )
+            editable = role in ("text", "password text", "text field") or "editable" in role
+            if not (clickish or role in ACTIONABLE_ROLES or editable):
+                continue
+            if not (record["enabled"] or record["sensitive"]):
+                continue
+            key = (record["x"], record["y"], record["width"], record["height"], record["name"], role)
+            if key in seen:
+                continue
+            seen.add(key)
+            actionable.append(record)
+
+        actionable.sort(key=lambda item: (
+            (item.get("window") or "").lower(),
+            item["y"],
+            item["x"],
+            item.get("depth", 0),
+        ))
+        marks = []
+        for index, record in enumerate(actionable[:limit], start=1):
+            item = dict(record)
+            item["mark"] = index
+            item["center_x"] = record["x"] + record["width"] // 2
+            item["center_y"] = record["y"] + record["height"] // 2
+            marks.append(item)
+        emit({
+            "ok": True,
+            "apps": app_count,
+            "count": len(marks),
+            "total": len(actionable),
+            "marks": marks,
+        })
+
     if command == "find":
         wanted = (options.get("name") or "").strip()
         role_filter = (options.get("role") or "").strip().lower()
-        if not wanted and not role_filter:
-            fail("find needs --name or --role")
+        if (
+            not wanted
+            and not role_filter
+            and not (options.get("path") or "").strip()
+            and not (options.get("state") or "").strip()
+            and not (options.get("action") or "").strip()
+        ):
+            fail("find needs --name, --role, --state, --action, or --path")
         exact = (options.get("exact") or "").lower() in ("1", "true", "yes")
         chosen, app_count = collect_matches(desktop, options, wanted, role_filter, exact)
         limit = max(1, min(int(options.get("limit", 20) or 20), 100))
@@ -494,6 +647,8 @@ def main():
             "found": bool(chosen),
             "query": wanted,
             "role": role_filter or None,
+            "state": (options.get("state") or None),
+            "action": (options.get("action") or None),
             "apps": app_count,
             "count": len(chosen),
             "nodes": nodes,
