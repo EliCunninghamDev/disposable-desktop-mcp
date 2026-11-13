@@ -50,6 +50,16 @@ const BTN_MIDDLE: u32 = 0x112;
 const BTN_FORWARD: u32 = 0x115;
 const BTN_BACK: u32 = 0x116;
 
+/// Modifier state supplied by a viewer's toolkit, independent of the XKB
+/// modifier-mask layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub super_key: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ModBits {
     shift: u32,
@@ -219,6 +229,9 @@ pub struct WaylandInput {
     held_mods: u32,
     /// key_down calls that include a non-modifier key.
     held_keys: HashMap<String, (u16, u32)>,
+    /// One-shot key presses from a viewer, keyed by keysym, with their level
+    /// and modifier mask, so the matching release restores state.
+    held_syms: HashMap<u32, (u16, u32)>,
 }
 
 impl WaylandInput {
@@ -265,6 +278,7 @@ impl WaylandInput {
             height: height.max(1),
             held_mods: 0,
             held_keys: HashMap::new(),
+            held_syms: HashMap::new(),
         };
         input.upload_keymap(&input.table.text.clone())?;
         input.keymap = KeymapKind::Base;
@@ -358,6 +372,10 @@ impl WaylandInput {
         self.held_mods
             | self
                 .held_keys
+                .values()
+                .fold(0, |mask, (_, contributed)| mask | contributed)
+            | self
+                .held_syms
                 .values()
                 .fold(0, |mask, (_, contributed)| mask | contributed)
     }
@@ -618,6 +636,35 @@ impl WaylandInput {
         Ok((mask, key))
     }
 
+    /// Forward a toolkit key event by keysym.  Modifier key events themselves
+    /// are represented by `modifiers`, not sent as ordinary keys.
+    pub fn key_sym(&mut self, keysym: u32, modifiers: Modifiers, pressed: bool) -> Result<Value> {
+        self.pump()?;
+        self.ensure_base_keymap()?;
+        let (keycode, level_mask) =
+            self.table.by_sym.get(&keysym).copied().ok_or_else(|| {
+                anyhow!("the default keymap has no keycode for keysym {keysym:#x}")
+            })?;
+        if pressed {
+            let mask = self.table.mods.mask_for_modifiers(modifiers) | level_mask;
+            self.held_syms.insert(keysym, (keycode, mask));
+            self.send_modifiers(self.effective_mods())?;
+            self.key_event(keycode as u32, true)?;
+        } else {
+            if let Some((code, _)) = self.held_syms.remove(&keysym) {
+                self.key_event(code as u32, false)?;
+            }
+            self.send_modifiers(self.effective_mods())?;
+        }
+        self.pump()?;
+        Ok(json!({
+            "ok": true,
+            "action": if pressed { "key_press" } else { "key_release" },
+            "keysym": keysym,
+            "backend": "wayland",
+        }))
+    }
+
     pub fn key_combo(&mut self, combo: &str, delay_ms: u32) -> Result<Value> {
         self.pump()?;
         self.ensure_base_keymap()?;
@@ -758,6 +805,17 @@ impl ModBits {
             "super" | "meta" | "win" | "logo" => self.super_key,
             _ => 0,
         }
+    }
+
+    fn mask_for_modifiers(&self, modifiers: Modifiers) -> u32 {
+        (if modifiers.shift { self.shift } else { 0 })
+            | (if modifiers.ctrl { self.ctrl } else { 0 })
+            | (if modifiers.alt { self.alt } else { 0 })
+            | (if modifiers.super_key {
+                self.super_key
+            } else {
+                0
+            })
     }
 
     fn bit_for_token(&self, token: &str) -> Option<u32> {

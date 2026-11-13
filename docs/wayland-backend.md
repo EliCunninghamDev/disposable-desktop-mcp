@@ -380,11 +380,39 @@ the server, not via `sway exec`, so the absolute host socket path and host
 `DISPLAY` never reach app environments. Only the sway process itself sees the
 host path (and host `DISPLAY`/`XAUTHORITY` for `WLR_BACKENDS=x11`).
 
+## Control arbitration
+
+Ownership lives in `$XDG_RUNTIME_DIR/xephyr-mcp/sessions/<id>.control.json`:
+
+```json
+{ "owner": "human", "pid": 1234, "since": 1794573677 }
+```
+
+The server reads it before every pointer, keyboard, or accessibility action and
+returns an error naming the controlling PID and time. `wait_for_control` polls
+the same file, so an agent can block until a viewer releases the session instead
+of retrying. A claim whose PID is no longer alive is treated as `agent` and the
+file is reset, which makes a crashed viewer harmless.
+
+The viewer claims `human` for its own PID when `c`/Control is activated and
+releases it on `Ctrl+Shift+C`, a second Control press, session switch, or window
+close. It forwards mouse, wheel, and keyboard events only while the claim is
+live; `Esc` and ordinary `c` presses are forwarded to the session rather than
+being consumed as viewer shortcuts. Trace PNGs are
+skipped while a person owns the session; frame hashes are still recorded.
+
+For nested Wayland, host input devices (`wayland-pointer-seat0`,
+`wayland-keyboard-seat0`) are parked on a `locked` seat while the agent works.
+Sway's runtime `seat attach` is additive and is not persisted, so the viewer
+rewrites the generated config's seat block and runs `swaymsg reload` when
+control changes; the reload is what removes the devices from the other seat.
+Headless sessions have no host devices and rely on viewer forwarding.
+
 ## Phases
 
 1. **Seam.** ✅ `Backend` in `src/backend.rs` dispatches capture, windows,
    resize, clipboard, and capability errors. X11 is a mechanical wrapper;
-   existing tests and the 35-tool catalog are unchanged.
+   existing tests and the tool catalog are unchanged.
 2. **Wayland lifecycle + capture.** ✅ Sway discovery/runtime, private bus and
    AT-SPI, generated config, `output * mode`, socket discovery, state/marker,
    `display_stop` via `swaymsg exit` + group sweep. Screencopy capture reuses
@@ -398,12 +426,17 @@ host path (and host `DISPLAY`/`XAUTHORITY` for `WLR_BACKENDS=x11`).
    Clipboard get/set through `zwlr_data_control_v1`; a per-session worker
    serves `send` requests and exits when the selection is replaced or the
    session stops.
-4. **Viewer + control.** **Planned.** Screencopy client, state-based discovery,
-   `c` toggle, `control` in state, server-side input refusal,
-   `wait_for_control`, no trace screenshots during human control, optional
-   blank/redacted capture. For nested sessions, enforce the lock by attaching
-   the wayland-backend devices to a `locked` seat (and reattaching on release);
-   for headless sessions, use viewer forwarding.
+4. **Viewer + control.** ✅ The GTK viewer reads `State` for both backends and
+   captures Wayland outputs through the same screencopy client. ✅ `c`/the
+   Control toggle claim human control in `<session>.control.json`; the server
+   refuses pointer, keyboard, and accessibility actions and skips trace PNGs
+   while a person owns the session. ✅ `wait_for_control` blocks until the
+   wanted owner appears, and a claim whose PID is gone is treated as stale. ✅
+   The viewer forwards mouse, wheel, and keyboard input (XTEST for X11,
+   virtual devices for Wayland). Nested Wayland sessions park host input on a
+   `locked` seat while the agent works, then rewrite the seat attachments and
+   reload sway when human control starts; headless sessions use viewer
+   forwarding. **Remaining:** optional blank/redacted capture.
 5. **Polish.** **Planned.** Per-window capture via
    `ext-foreign-toplevel-image-capture-source`, labwc support or an explicit
    capability error, packaging, docs, smoke tests in CI. Nested mode is

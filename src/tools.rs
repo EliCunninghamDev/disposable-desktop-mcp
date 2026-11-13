@@ -1,6 +1,7 @@
 //! Tool definitions and handlers.
 
 use crate::backend::{self, BackendKind, CaptureRect, CaptureTarget};
+use crate::control::{self, Owner};
 use crate::display::{DisplayManager, Session};
 use crate::env::Tool;
 use crate::mcp::CallResult;
@@ -150,6 +151,18 @@ pub fn definitions() -> Vec<Value> {
                         "required": ["x", "y", "width", "height"],
                         "additionalProperties": false
                     }
+                }),
+                &[],
+            ),
+        ),
+        tool(
+            "wait_for_control",
+            "Block until the session's input control owner is agent or human. A viewer claims human control before forwarding host input; the server refuses pointer, keyboard, and accessibility actions while that lasts. A human claim whose process has exited is treated as stale, so a crashed viewer cannot lock the agent out.",
+            schema(
+                json!({
+                    "owner": { "type": "string", "enum": ["agent", "human"], "description": "Control owner to wait for (default agent)" },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 120000, "description": "Give up after this long (default 10000)" },
+                    "poll_ms": { "type": "integer", "minimum": 20, "maximum": 5000, "description": "Polling interval (default 100)" }
                 }),
                 &[],
             ),
@@ -498,6 +511,7 @@ async fn pointer_move_tool(
     x: i32,
     y: i32,
 ) -> Result<Value> {
+    session.require_agent_control()?;
     match session.backend.kind() {
         BackendKind::X11 => {
             let tool = xdotool(manager)?;
@@ -521,6 +535,7 @@ async fn pointer_click_tool(
     count: u32,
     modifiers: &[String],
 ) -> Result<Value> {
+    session.require_agent_control()?;
     match session.backend.kind() {
         BackendKind::X11 => {
             let tool = xdotool(manager)?;
@@ -545,6 +560,7 @@ async fn pointer_button_tool(
     button: u32,
     down: bool,
 ) -> Result<Value> {
+    session.require_agent_control()?;
     match session.backend.kind() {
         BackendKind::X11 => {
             let tool = xdotool(manager)?;
@@ -567,6 +583,7 @@ async fn pointer_drag_tool(
     button: u32,
     duration_ms: u32,
 ) -> Result<Value> {
+    session.require_agent_control()?;
     match session.backend.kind() {
         BackendKind::X11 => {
             let tool = xdotool(manager)?;
@@ -588,6 +605,7 @@ async fn pointer_scroll_tool(
     up: bool,
     amount: u32,
 ) -> Result<Value> {
+    session.require_agent_control()?;
     match session.backend.kind() {
         BackendKind::X11 => {
             let tool = xdotool(manager)?;
@@ -608,6 +626,7 @@ async fn key_tool(
     combo: &str,
     delay_ms: u32,
 ) -> Result<Value> {
+    session.require_agent_control()?;
     match session.backend.kind() {
         BackendKind::X11 => {
             let tool = xdotool(manager)?;
@@ -629,6 +648,7 @@ async fn key_hold_tool(
     combo: &str,
     down: bool,
 ) -> Result<Value> {
+    session.require_agent_control()?;
     match session.backend.kind() {
         BackendKind::X11 => {
             let tool = xdotool(manager)?;
@@ -650,6 +670,7 @@ async fn type_tool(
     text: &str,
     delay_ms: u32,
 ) -> Result<Value> {
+    session.require_agent_control()?;
     match session.backend.kind() {
         BackendKind::X11 => {
             let tool = xdotool(manager)?;
@@ -670,7 +691,11 @@ pub async fn call(manager: &DisplayManager, name: &str, args: &Value) -> CallRes
     let started = std::time::Instant::now();
     let before_session = manager.session().await;
     let hashed = trace::should_hash(name);
-    let with_png = hashed && trace::screenshots_enabled();
+    let agent_control = before_session
+        .as_ref()
+        .map(|session| session.control().owner == Owner::Agent)
+        .unwrap_or(true);
+    let with_png = hashed && trace::screenshots_enabled() && agent_control;
     let before = if hashed {
         capture_state(before_session.as_ref(), with_png).await
     } else {
@@ -1209,6 +1234,36 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             };
             Ok(CallResult::text(&wait::run(&session, &spec).await?))
         }
+        "wait_for_control" => {
+            let session = active(manager).await?;
+            let owner = match opt_str(args, "owner").unwrap_or("agent") {
+                "agent" => Owner::Agent,
+                "human" => Owner::Human,
+                other => {
+                    return Err(anyhow!(
+                        "owner must be \"agent\" or \"human\", got {other:?}"
+                    ))
+                }
+            };
+            let timeout = Duration::from_millis(
+                opt_u64(args, "timeout_ms")
+                    .unwrap_or(10_000)
+                    .clamp(1, 120_000),
+            );
+            let poll =
+                Duration::from_millis(opt_u64(args, "poll_ms").unwrap_or(100).clamp(20, 5000));
+            let started = std::time::Instant::now();
+            let state = control::wait(&session.info.session_id, owner, timeout, poll).await;
+            Ok(CallResult::text(&json!({
+                "display": session.info.display,
+                "owner": state.owner.as_str(),
+                "pid": (state.owner == Owner::Human).then_some(state.pid),
+                "since": (state.owner == Owner::Human).then_some(state.since),
+                "satisfied": state.owner == owner,
+                "timed_out": state.owner != owner,
+                "waited_ms": started.elapsed().as_millis() as u64,
+            })))
+        }
         "clipboard_get" => {
             let session = active(manager).await?;
             session.require_clipboard()?;
@@ -1466,6 +1521,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "a11y_set_text" => {
             let session = active(manager).await?;
+            session.require_agent_control()?;
             let name = opt_str(args, "name");
             let path = opt_str(args, "path");
             if name.is_none() && path.is_none() {
@@ -1486,6 +1542,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "a11y_focus" => {
             let session = active(manager).await?;
+            session.require_agent_control()?;
             let name = opt_str(args, "name");
             let path = opt_str(args, "path");
             let role = opt_str(args, "role");
@@ -1641,6 +1698,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
         }
         "a11y_click" => {
             let session = active(manager).await?;
+            session.require_agent_control()?;
             let name = opt_str(args, "name");
             let role = opt_str(args, "role");
             let path = opt_str(args, "path");
@@ -1895,6 +1953,7 @@ async fn diagnose(manager: &DisplayManager) -> Value {
                 .map(|display| session.info.runtime_dir.join(display).exists())
                 .unwrap_or(false),
         };
+        let session_control = control::effective(&session.info.session_id);
         json!({
             "session_id": session.info.session_id,
             "display": session.info.display,
@@ -1914,6 +1973,8 @@ async fn diagnose(manager: &DisplayManager) -> Value {
             "home": session.info.home.as_ref().map(|path| path.display().to_string()),
             "persistent_home": session.info.persistent_home,
             "trace": trace::session_path(&session.info.session_id).display().to_string(),
+            "control": session_control.owner.as_str(),
+            "control_pid": (session_control.owner == Owner::Human).then_some(session_control.pid),
             "launched": session.launch_count(),
         })
     });
@@ -1941,6 +2002,7 @@ async fn diagnose(manager: &DisplayManager) -> Value {
             "Xephyr/Xvfb are found in the bundled runtime tree even when they are absent from the host PATH.",
             "X servers do not implement -version; their path identifies the bundled build.",
             "The nested desktop defaults to X11; backend=wayland uses sway with output capture, sway-IPC window control, display resize, virtual pointer/keyboard input, and the data-control clipboard.",
+            "A viewer claims human control with c; wait_for_control blocks until it is released, and input/a11y tools are refused meanwhile.",
             "AT-SPI requires PyGObject in the python3 environment (python_atspi).",
             "XEPHYR_MCP_IDLE_TIMEOUT_SECS and XEPHYR_MCP_MAX_LIFETIME_SECS enable the auto-teardown watchdog.",
             "Set persist_home=true to keep app profiles across display_stop/display_start with the same session_id.",

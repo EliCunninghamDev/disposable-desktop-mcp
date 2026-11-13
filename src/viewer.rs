@@ -6,22 +6,29 @@
 //! compositing, double buffering, input handling and native session dropdown,
 //! so the window does not flicker and the controls behave like normal widgets.
 //!
-//! The viewer is read-only: it never sends input to a nested display.
+//! The viewer is read-only until a person claims control with `c`: it then
+//! forwards mouse, wheel, and keyboard events to the selected session and the
+//! server refuses agent input until control is released.
 
 use anyhow::{anyhow, bail, Result};
+use glib::translate::IntoGlib;
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::{cairo, gdk, glib};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode, Window};
+use x11rb::protocol::xtest;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
+use crate::backend::{Backend, CaptureTarget};
+use crate::control::{self, Owner};
 use crate::state::{self, State};
-use crate::{screenshot, x11};
+use crate::{screenshot, wl_input, x11};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const TOOLBAR_H: i32 = 38;
@@ -68,9 +75,19 @@ struct Target {
     height: u16,
     session_id: Option<String>,
     started_at: u64,
+    backend: Backend,
 }
 
 impl Target {
+    /// Wayland sessions all use `wayland-1` in their private runtime dirs, so
+    /// the session id is the identity; X11 falls back to the display name.
+    fn key(&self) -> String {
+        self.session_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| self.display.clone())
+    }
+
     fn label(&self) -> String {
         self.session_id
             .clone()
@@ -80,11 +97,12 @@ impl Target {
 
     fn menu_label(&self) -> String {
         format!(
-            "{}  -  {}  {}x{}",
+            "{}  -  {}  {}x{}  {}",
             self.label(),
             self.display,
             self.width,
-            self.height
+            self.height,
+            self.backend.kind().as_str()
         )
     }
 }
@@ -146,9 +164,12 @@ OPTIONS:
     --no-aspect-lock      Do not lock the window to the display aspect ratio
     -h, --help            Show this help
 
-The toolbar has a session dropdown and Single/BSP buttons.  Keys: q / Esc quit,
-f / F11 fullscreen, t toggle BSP, s cycle sessions.  The viewer is read-only; it
-never sends input to a nested display.
+The toolbar has a session dropdown, Single/BSP buttons, and a Control toggle.
+Keys: c claim human control, Ctrl+Shift+C release it (the Control button also
+toggles), q quit, f / F11 fullscreen, t toggle BSP, s cycle sessions.  While
+human control is active every other key, including Esc, is forwarded to the
+session; Ctrl+Shift+Q closes the viewer.  Input is forwarded only in Single
+mode.
 
 The viewer prefers the X11 backend when an X display is available so that the
 window aspect hint and window management behave consistently; set GDK_BACKEND
@@ -208,14 +229,35 @@ fn parse_options() -> Result<Option<Options>> {
 }
 
 fn target_from_state(state: &State) -> Option<Target> {
-    let (conn, screen_num) = x11::connect(&state.display).ok()?;
-    let (width, height) = x11::screen_size(&conn, screen_num);
+    let backend = Backend::from_state(state);
+    let (width, height) = match &backend {
+        Backend::X11 { display } => {
+            let (conn, screen_num) = x11::connect(display).ok()?;
+            x11::screen_size(&conn, screen_num)
+        }
+        Backend::Wayland {
+            swaysock, output, ..
+        } => {
+            let expected = (!output.is_empty()).then_some(output.as_str());
+            match crate::sway::output_size(swaysock, expected) {
+                Ok((width, height)) => (
+                    width.min(u16::MAX as u32) as u16,
+                    height.min(u16::MAX as u32) as u16,
+                ),
+                Err(_) if state.width > 0 && state.height > 0 => {
+                    (state.width as u16, state.height as u16)
+                }
+                Err(_) => return None,
+            }
+        }
+    };
     Some(Target {
         display: state.display.clone(),
         width,
         height,
         session_id: Some(state.session_id.clone()).filter(|id| !id.is_empty()),
         started_at: state.started_at,
+        backend,
     })
 }
 
@@ -255,12 +297,12 @@ fn discover_sessions() -> Vec<Target> {
         }
     }
     for target in scan_displays(None) {
-        if !targets.iter().any(|item| item.display == target.display) {
+        if !targets.iter().any(|item| item.key() == target.key()) {
             targets.push(target);
         }
     }
     targets.sort_by_key(|target| std::cmp::Reverse(target.started_at));
-    targets.dedup_by(|a, b| a.display == b.display);
+    targets.dedup_by(|a, b| a.key() == b.key());
     targets
 }
 
@@ -279,6 +321,9 @@ fn discover_target(options: &Options) -> Result<Target> {
                 .map(|state| state.session_id.clone())
                 .filter(|id| !id.is_empty()),
             started_at: state.map(|state| state.started_at).unwrap_or(0),
+            backend: Backend::X11 {
+                display: display.clone(),
+            },
         });
     }
 
@@ -319,14 +364,141 @@ fn discover_target(options: &Options) -> Result<Target> {
     )
 }
 
-struct Pane {
-    target: Target,
+/// X11 capture plus XTEST input for a pane.  Wayland panes use the library
+/// Backend instead of a long-lived X connection.
+struct X11View {
     conn: RustConnection,
     screen: usize,
-    root: x11rb::protocol::xproto::Window,
+    root: Window,
+    keymap: HashMap<u32, u8>,
+    mods: u32,
+}
+
+impl X11View {
+    fn new(conn: RustConnection, screen: usize) -> Self {
+        let root = x11::root(&conn, screen);
+        let mut keymap = HashMap::new();
+        let setup = conn.setup();
+        let min = setup.min_keycode;
+        let max = setup.max_keycode;
+        if max >= min {
+            if let Some(reply) = conn
+                .get_keyboard_mapping(min, max - min + 1)
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+            {
+                let per = reply.keysyms_per_keycode.max(1) as usize;
+                for (index, chunk) in reply.keysyms.chunks(per).enumerate() {
+                    for sym in chunk {
+                        if *sym != 0 {
+                            keymap.entry(*sym).or_insert((min as usize + index) as u8);
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            conn,
+            screen,
+            root,
+            keymap,
+            mods: 0,
+        }
+    }
+
+    fn pointer(&self) -> Option<(i16, i16)> {
+        self.conn
+            .query_pointer(self.root)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .filter(|reply| reply.same_screen)
+            .map(|reply| (reply.root_x, reply.root_y))
+    }
+
+    fn motion(&self, x: i32, y: i32) {
+        let _ = xtest::fake_input(
+            &self.conn,
+            6, // MotionNotify
+            0,
+            0,
+            self.root,
+            x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            0,
+        )
+        .map(|cookie| cookie.check());
+    }
+
+    fn button(&self, button: u32, down: bool) {
+        let _ = xtest::fake_input(
+            &self.conn,
+            if down { 4 } else { 5 }, // ButtonPress / ButtonRelease
+            button.min(255) as u8,
+            0,
+            self.root,
+            0,
+            0,
+            0,
+        )
+        .map(|cookie| cookie.check());
+    }
+
+    fn raw_key(&self, keycode: u8, down: bool) {
+        let _ = xtest::fake_input(
+            &self.conn,
+            if down { 2 } else { 3 }, // KeyPress / KeyRelease
+            keycode,
+            0,
+            self.root,
+            0,
+            0,
+            0,
+        )
+        .map(|cookie| cookie.check());
+    }
+
+    fn sync_mods(&mut self, modifiers: wl_input::Modifiers) {
+        let desired = (if modifiers.shift { 1 } else { 0 })
+            | (if modifiers.ctrl { 4 } else { 0 })
+            | (if modifiers.alt { 8 } else { 0 })
+            | (if modifiers.super_key { 64 } else { 0 });
+        for (bit, keycode) in [(1u32, 50u8), (4, 37), (8, 64), (64, 133)] {
+            let had = self.mods & bit != 0;
+            let want = desired & bit != 0;
+            if want && !had {
+                self.raw_key(keycode, true);
+            } else if had && !want {
+                self.raw_key(keycode, false);
+            }
+        }
+        self.mods = desired;
+    }
+
+    fn key(&mut self, keysym: u32, modifiers: wl_input::Modifiers, down: bool) {
+        self.sync_mods(modifiers);
+        if let Some(keycode) = self.keymap.get(&keysym).copied() {
+            self.raw_key(keycode, down);
+        }
+    }
+
+    fn scroll(&mut self, up: bool, amount: u32) {
+        let button = if up { 4 } else { 5 };
+        for _ in 0..amount.clamp(1, 100) {
+            self.button(button, true);
+            self.button(button, false);
+        }
+    }
+}
+
+struct Pane {
+    target: Target,
+    x11: Option<X11View>,
     texture: Option<cairo::ImageSurface>,
     pointer: Option<(i16, i16)>,
     error: Option<String>,
+    /// Screen rectangle of the painted frame, used to map viewer input back
+    /// into nested display coordinates.
+    last_inner: Option<Rect>,
 }
 
 struct Viewer {
@@ -335,6 +507,7 @@ struct Viewer {
     dropdown: gtk::DropDown,
     single_button: gtk::ToggleButton,
     bsp_button: gtk::ToggleButton,
+    control_button: gtk::ToggleButton,
     sessions: Vec<Target>,
     labels: Vec<String>,
     panes: Vec<Pane>,
@@ -346,6 +519,10 @@ struct Viewer {
     pinned: Option<Target>,
     syncing: bool,
     fps: u32,
+    control: Owner,
+    /// True only when this viewer's PID owns the human claim.
+    control_owned: bool,
+    last_pointer: Option<(f64, f64)>,
 }
 
 pub fn run() -> Result<()> {
@@ -460,6 +637,12 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
     toolbar.append(&single_button);
     toolbar.append(&bsp_button);
 
+    let control_button = gtk::ToggleButton::with_label("Control");
+    control_button.set_tooltip_text(Some(
+        "Take human control and forward mouse/keyboard to the session (c)",
+    ));
+    toolbar.append(&control_button);
+
     let canvas = gtk::DrawingArea::new();
     canvas.set_hexpand(true);
     canvas.set_vexpand(true);
@@ -473,7 +656,7 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
 
     let selected = first
         .as_ref()
-        .map(|target| target.display.clone())
+        .map(|target| target.key())
         .unwrap_or_default();
     let viewer = Rc::new(RefCell::new(Viewer {
         window: window.clone(),
@@ -481,6 +664,7 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
         dropdown: dropdown.clone(),
         single_button: single_button.clone(),
         bsp_button: bsp_button.clone(),
+        control_button: control_button.clone(),
         sessions: Vec::new(),
         labels: Vec::new(),
         panes: Vec::new(),
@@ -492,12 +676,15 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
         pinned: first,
         syncing: false,
         fps: options.fps,
+        control: Owner::Agent,
+        control_owned: false,
+        last_pointer: None,
     }));
 
     {
         let viewer = viewer.clone();
         canvas.set_draw_func(move |_area, context, width, height| {
-            if let Ok(viewer) = viewer.try_borrow() {
+            if let Ok(mut viewer) = viewer.try_borrow_mut() {
                 viewer.draw(context, width, height);
             }
         });
@@ -519,10 +706,13 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
             let Some(target) = viewer.sessions.get(index as usize).cloned() else {
                 return;
             };
-            if target.display == viewer.selected {
+            if target.key() == viewer.selected {
                 return;
             }
-            viewer.selected = target.display;
+            if viewer.control_owned {
+                let _ = viewer.set_human(false);
+            }
+            viewer.selected = target.key();
             viewer.layout = Layout::Single;
             viewer.sync_panes();
             viewer.sync_buttons();
@@ -561,15 +751,47 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
 
     {
         let key = gtk::EventControllerKey::new();
+        let released_viewer = viewer.clone();
         let viewer = viewer.clone();
         key.connect_key_pressed(move |_, keyval, _, modifiers| {
-            if modifiers.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK) {
-                return glib::Propagation::Proceed;
-            }
             let Ok(mut viewer) = viewer.try_borrow_mut() else {
                 return glib::Propagation::Proceed;
             };
+            if viewer.control == Owner::Human {
+                let chord = modifiers
+                    .contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK);
+                if chord && matches!(keyval, gdk::Key::c | gdk::Key::C) {
+                    if viewer.control_owned {
+                        if let Err(err) = viewer.set_human(false) {
+                            eprintln!("[xephyr-mcp-viewer] release control: {err:#}");
+                        }
+                    }
+                    return glib::Propagation::Stop;
+                }
+                if chord && matches!(keyval, gdk::Key::q | gdk::Key::Q) {
+                    viewer.window.close();
+                    return glib::Propagation::Stop;
+                }
+                if !viewer.control_owned {
+                    return glib::Propagation::Proceed;
+                }
+                return if viewer.forward_key(keyval.into_glib(), modifiers, true) {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                };
+            }
+            if modifiers.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK) {
+                return glib::Propagation::Proceed;
+            }
             let stop = match keyval {
+                gdk::Key::c | gdk::Key::C => {
+                    if let Err(err) = viewer.set_human(true) {
+                        eprintln!("[xephyr-mcp-viewer] claim control: {err:#}");
+                    }
+                    viewer.sync_buttons();
+                    true
+                }
                 gdk::Key::q | gdk::Key::Q | gdk::Key::Escape => {
                     viewer.window.close();
                     true
@@ -600,7 +822,89 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
                 glib::Propagation::Proceed
             }
         });
+        key.connect_key_released(move |_, keyval, _, modifiers| {
+            if let Ok(mut viewer) = released_viewer.try_borrow_mut() {
+                if viewer.control == Owner::Human {
+                    viewer.forward_key(keyval.into_glib(), modifiers, false);
+                }
+            }
+        });
         window.add_controller(key);
+    }
+
+    {
+        let viewer = viewer.clone();
+        control_button.connect_toggled(move |button| {
+            let Ok(mut viewer) = viewer.try_borrow_mut() else {
+                return;
+            };
+            if viewer.syncing {
+                return;
+            }
+            let want = button.is_active();
+            if want == viewer.control_owned {
+                return;
+            }
+            if let Err(err) = viewer.set_human(want) {
+                eprintln!("[xephyr-mcp-viewer] control: {err:#}");
+            }
+            viewer.sync_buttons();
+        });
+    }
+
+    {
+        let motion = gtk::EventControllerMotion::new();
+        let viewer = viewer.clone();
+        motion.connect_motion(move |_, x, y| {
+            if let Ok(mut viewer) = viewer.try_borrow_mut() {
+                viewer.last_pointer = Some((x, y));
+                viewer.forward_motion(x, y);
+            }
+        });
+        canvas.add_controller(motion);
+    }
+
+    {
+        let click = gtk::GestureClick::new();
+        click.set_button(0);
+        let released_viewer = viewer.clone();
+        let viewer = viewer.clone();
+        click.connect_pressed(move |gesture, _, x, y| {
+            if let Ok(mut viewer) = viewer.try_borrow_mut() {
+                viewer.last_pointer = Some((x, y));
+                viewer.forward_button(gesture.current_button(), x, y, true);
+            }
+        });
+        click.connect_released(move |gesture, _, x, y| {
+            if let Ok(mut viewer) = released_viewer.try_borrow_mut() {
+                viewer.forward_button(gesture.current_button(), x, y, false);
+            }
+        });
+        canvas.add_controller(click);
+    }
+
+    {
+        let scroll = gtk::EventControllerScroll::new(
+            gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
+        );
+        let viewer = viewer.clone();
+        scroll.connect_scroll(move |_, _dx, dy| {
+            if let Ok(mut viewer) = viewer.try_borrow_mut() {
+                viewer.forward_scroll(dy);
+            }
+            glib::Propagation::Stop
+        });
+        canvas.add_controller(scroll);
+    }
+
+    {
+        let viewer = viewer.clone();
+        window.connect_close_request(move |_| {
+            if let Ok(mut viewer) = viewer.try_borrow_mut() {
+                viewer.release_control();
+            }
+            glib::Propagation::Proceed
+        });
     }
 
     schedule_capture(viewer.clone());
@@ -676,25 +980,223 @@ fn install_css() {
 }
 
 impl Viewer {
+    fn sync_control(&mut self) {
+        let state = self
+            .current_target()
+            .and_then(|target| target.session_id.as_ref())
+            .filter(|id| !id.is_empty())
+            .map(|id| control::effective(id))
+            .unwrap_or_default();
+        self.control = state.owner;
+        self.control_owned = state.owner == Owner::Human && state.pid == std::process::id();
+    }
+
+    /// Claim or release human input control.  The server reads the same file
+    /// and refuses agent input while the claim is live.
+    fn set_human(&mut self, enabled: bool) -> Result<()> {
+        let target = self
+            .current_target()
+            .cloned()
+            .ok_or_else(|| anyhow!("no session is selected"))?;
+        let session_id = target
+            .session_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "this session has no id; start it with display_start session_id=... to use viewer control"
+                )
+            })?;
+        let pid = std::process::id();
+        let state = if enabled {
+            control::claim(&session_id, Owner::Human, pid)?
+        } else {
+            control::release(&session_id, pid)?
+        };
+        if let Err(err) = target.backend.set_host_input(enabled) {
+            eprintln!("[xephyr-mcp-viewer] host input: {err:#}");
+        }
+        self.control = state.owner;
+        self.control_owned = state.owner == Owner::Human && state.pid == pid;
+        self.syncing = true;
+        self.control_button.set_active(self.control_owned);
+        self.syncing = false;
+        self.update_title();
+        Ok(())
+    }
+
+    fn release_control(&mut self) {
+        if self.control_owned {
+            let _ = self.set_human(false);
+        }
+    }
+
+    /// Map a canvas point through the letterboxed frame into nested pixels.
+    fn nested_point(&self, x: f64, y: f64) -> Option<(i32, i32)> {
+        if self.layout != Layout::Single {
+            return None;
+        }
+        let pane = self.panes.first()?;
+        let inner = pane.last_inner?;
+        if x < inner.x as f64
+            || y < inner.y as f64
+            || x >= (inner.x + inner.w) as f64
+            || y >= (inner.y + inner.h) as f64
+        {
+            return None;
+        }
+        let width = pane.target.width.max(1) as f64;
+        let height = pane.target.height.max(1) as f64;
+        let nx = ((x - inner.x as f64) * width / inner.w.max(1) as f64).round() as i32;
+        let ny = ((y - inner.y as f64) * height / inner.h.max(1) as f64).round() as i32;
+        Some((
+            nx.clamp(0, width as i32 - 1),
+            ny.clamp(0, height as i32 - 1),
+        ))
+    }
+
+    fn forward_motion(&mut self, x: f64, y: f64) {
+        if !self.control_owned {
+            return;
+        }
+        let Some((nx, ny)) = self.nested_point(x, y) else {
+            return;
+        };
+        let Some(pane) = self.panes.first_mut() else {
+            return;
+        };
+        match &pane.target.backend {
+            Backend::X11 { .. } => {
+                if let Some(view) = pane.x11.as_mut() {
+                    view.motion(nx, ny);
+                }
+            }
+            Backend::Wayland { .. } => {
+                let backend = pane.target.backend.clone();
+                let _ = backend.pointer_move(nx, ny);
+            }
+        }
+    }
+
+    fn forward_button(&mut self, button: u32, x: f64, y: f64, down: bool) {
+        if !self.control_owned || button == 0 {
+            return;
+        }
+        let at = self.nested_point(x, y);
+        let Some(pane) = self.panes.first_mut() else {
+            return;
+        };
+        match &pane.target.backend {
+            Backend::X11 { .. } => {
+                if let Some(view) = pane.x11.as_mut() {
+                    if let Some((nx, ny)) = at {
+                        view.motion(nx, ny);
+                    }
+                    view.button(button, down);
+                }
+            }
+            Backend::Wayland { .. } => {
+                let backend = pane.target.backend.clone();
+                let _ = backend.pointer_button(at, button, down);
+            }
+        }
+    }
+
+    fn forward_scroll(&mut self, dy: f64) {
+        if !self.control_owned || dy == 0.0 {
+            return;
+        }
+        let up = dy < 0.0;
+        let amount = dy.abs().round().clamp(1.0, 20.0) as u32;
+        let at = self.last_pointer.and_then(|(x, y)| self.nested_point(x, y));
+        let Some(pane) = self.panes.first_mut() else {
+            return;
+        };
+        match &pane.target.backend {
+            Backend::X11 { .. } => {
+                if let Some(view) = pane.x11.as_mut() {
+                    view.scroll(up, amount);
+                }
+            }
+            Backend::Wayland { .. } => {
+                let backend = pane.target.backend.clone();
+                let _ = backend.pointer_scroll(at, up, amount);
+            }
+        }
+    }
+
+    fn forward_key(&mut self, keyval: u32, modifiers: gdk::ModifierType, pressed: bool) -> bool {
+        if !self.control_owned || self.layout != Layout::Single {
+            return false;
+        }
+        let mods = wl_input::Modifiers {
+            shift: modifiers.contains(gdk::ModifierType::SHIFT_MASK),
+            ctrl: modifiers.contains(gdk::ModifierType::CONTROL_MASK),
+            alt: modifiers.contains(gdk::ModifierType::ALT_MASK),
+            super_key: modifiers.contains(gdk::ModifierType::SUPER_MASK),
+        };
+        // Modifier keys are represented by `mods`, not sent as ordinary keys.
+        let modifier_key = matches!(
+            keyval,
+            0xffe1..=0xffe6 | 0xffe7..=0xffec | 0xff7f
+        );
+        let Some(pane) = self.panes.first_mut() else {
+            return false;
+        };
+        match &pane.target.backend {
+            Backend::X11 { .. } => {
+                let Some(view) = pane.x11.as_mut() else {
+                    return false;
+                };
+                if modifier_key {
+                    view.sync_mods(mods);
+                } else {
+                    view.key(keyval, mods, pressed);
+                }
+                true
+            }
+            Backend::Wayland { .. } => {
+                if modifier_key {
+                    return true;
+                }
+                let backend = pane.target.backend.clone();
+                let _ = backend.key_sym(keyval, mods, pressed);
+                true
+            }
+        }
+    }
+
     fn tick(&mut self) {
         if !self.canvas.is_mapped() {
             return;
         }
         for pane in self.panes.iter_mut() {
-            match screenshot::capture_from(&pane.conn, pane.screen) {
-                Ok(frame) => {
+            let captured = match &pane.target.backend {
+                Backend::X11 { .. } => match pane.x11.as_ref() {
+                    Some(view) => screenshot::capture_from(&view.conn, view.screen)
+                        .map(|frame| (frame, view.pointer())),
+                    None => continue,
+                },
+                Backend::Wayland { .. } => pane
+                    .target
+                    .backend
+                    .capture(&CaptureTarget::Output, true)
+                    .map(|capture| (capture.frame, None)),
+            };
+            match captured {
+                Ok((frame, pointer)) => {
                     // Keep the native-resolution frame and let Cairo scale it
                     // into the pane when painting.  Software resizing here made
                     // each tick expensive enough to starve GTK's redraw source.
+                    if frame.width != pane.target.width as u32
+                        || frame.height != pane.target.height as u32
+                    {
+                        pane.target.width = frame.width.min(u16::MAX as u32) as u16;
+                        pane.target.height = frame.height.min(u16::MAX as u32) as u16;
+                    }
                     pane.texture =
                         image_surface(&frame.rgba, frame.width as i32, frame.height as i32);
-                    pane.pointer = pane
-                        .conn
-                        .query_pointer(pane.root)
-                        .ok()
-                        .and_then(|cookie| cookie.reply().ok())
-                        .filter(|reply| reply.same_screen)
-                        .map(|reply| (reply.root_x, reply.root_y));
+                    pane.pointer = pointer;
                     pane.error = None;
                 }
                 Err(err) => pane.error = Some(short_error(&err)),
@@ -706,35 +1208,24 @@ impl Viewer {
     fn refresh_sessions(&mut self) {
         let mut sessions = discover_sessions();
         if let Some(pinned) = &self.pinned {
-            if !sessions
-                .iter()
-                .any(|target| target.display == pinned.display)
-            {
-                if let Ok((conn, screen_num)) = x11::connect(&pinned.display) {
-                    let (width, height) = x11::screen_size(&conn, screen_num);
-                    sessions.push(Target {
-                        display: pinned.display.clone(),
-                        width,
-                        height,
-                        session_id: pinned.session_id.clone(),
-                        started_at: pinned.started_at,
-                    });
-                }
+            if !sessions.iter().any(|target| target.key() == pinned.key()) {
+                sessions.push(pinned.clone());
             }
         }
         sessions.sort_by_key(|target| std::cmp::Reverse(target.started_at));
-        sessions.dedup_by(|a, b| a.display == b.display);
+        sessions.dedup_by(|a, b| a.key() == b.key());
         self.sessions = sessions;
 
         if !self
             .sessions
             .iter()
-            .any(|target| target.display == self.selected)
+            .any(|target| target.key() == self.selected)
         {
             if let Some(first) = self.sessions.first() {
-                self.selected = first.display.clone();
+                self.selected = first.key();
             }
         }
+        self.sync_control();
         self.sync_dropdown();
         self.sync_panes();
         self.sync_buttons();
@@ -755,7 +1246,7 @@ impl Viewer {
         let selected = self
             .sessions
             .iter()
-            .position(|target| target.display == self.selected)
+            .position(|target| target.key() == self.selected)
             .map(|index| index as u32)
             .unwrap_or(gtk::INVALID_LIST_POSITION);
 
@@ -776,7 +1267,7 @@ impl Viewer {
             Layout::Single => self
                 .sessions
                 .iter()
-                .find(|target| target.display == self.selected)
+                .find(|target| target.key() == self.selected)
                 .or(self.pinned.as_ref())
                 .cloned()
                 .into_iter()
@@ -789,21 +1280,28 @@ impl Viewer {
             if let Some(index) = self
                 .panes
                 .iter()
-                .position(|pane| pane.target.display == target.display)
+                .position(|pane| pane.target.key() == target.key())
             {
                 let mut pane = self.panes.remove(index);
                 pane.target = target;
                 panes.push(pane);
-            } else if let Ok((conn, screen)) = x11::connect(&target.display) {
-                let root = x11::root(&conn, screen);
+            } else {
+                let x11 = match &target.backend {
+                    Backend::X11 { display } => {
+                        let Ok((conn, screen)) = x11::connect(display) else {
+                            continue;
+                        };
+                        Some(X11View::new(conn, screen))
+                    }
+                    Backend::Wayland { .. } => None,
+                };
                 panes.push(Pane {
                     target,
-                    conn,
-                    screen,
-                    root,
+                    x11,
                     texture: None,
                     pointer: None,
                     error: None,
+                    last_inner: None,
                 });
             }
         }
@@ -814,6 +1312,7 @@ impl Viewer {
         self.syncing = true;
         self.single_button.set_active(self.layout == Layout::Single);
         self.bsp_button.set_active(self.layout == Layout::Bsp);
+        self.control_button.set_active(self.control_owned);
         let tile_count = self.sessions.len().min(MAX_PANES);
         self.bsp_button.set_label(&if tile_count == 0 {
             "BSP".to_string()
@@ -853,11 +1352,15 @@ impl Viewer {
         let index = self
             .sessions
             .iter()
-            .position(|target| target.display == self.selected)
+            .position(|target| target.key() == self.selected)
             .unwrap_or(0);
         let next = (index + 1) % self.sessions.len();
-        self.selected = self.sessions[next].display.clone();
+        if self.control_owned {
+            let _ = self.set_human(false);
+        }
+        self.selected = self.sessions[next].key();
         self.layout = Layout::Single;
+        self.sync_control();
         self.sync_dropdown();
         self.sync_panes();
         self.sync_buttons();
@@ -879,7 +1382,7 @@ impl Viewer {
     fn current_target(&self) -> Option<&Target> {
         self.sessions
             .iter()
-            .find(|target| target.display == self.selected)
+            .find(|target| target.key() == self.selected)
             .or(self.sessions.first())
             .or(self.pinned.as_ref())
     }
@@ -900,8 +1403,13 @@ impl Viewer {
             Layout::Single => String::new(),
             Layout::Bsp => format!(" [bsp {}]", self.panes.len()),
         };
+        let control = if self.control == Owner::Human {
+            " [HUMAN]"
+        } else {
+            ""
+        };
         self.window.set_title(Some(&format!(
-            "xephyr mcp viewer - {label} ({width}x{height}){suffix}"
+            "xephyr mcp viewer - {label} ({width}x{height}){suffix}{control}"
         )));
     }
 
@@ -918,7 +1426,7 @@ impl Viewer {
         }
     }
 
-    fn draw(&self, context: &cairo::Context, width: i32, height: i32) {
+    fn draw(&mut self, context: &cairo::Context, width: i32, height: i32) {
         set_source(context, COL_BG);
         context.rectangle(0.0, 0.0, width as f64, height as f64);
         let _ = context.fill();
@@ -938,7 +1446,9 @@ impl Viewer {
 
         let leaves = self.layout_rects(width, height);
         let bsp = self.layout == Layout::Bsp;
-        for (index, pane) in self.panes.iter().enumerate() {
+        let cursor = self.cursor;
+        for (index, pane) in self.panes.iter_mut().enumerate() {
+            pane.last_inner = None;
             let leaf = leaves.get(index).copied().unwrap_or(Rect {
                 x: 0,
                 y: 0,
@@ -956,6 +1466,7 @@ impl Viewer {
             context.rectangle(rect.x as f64, rect.y as f64, rect.w as f64, rect.h as f64);
             let _ = context.fill();
 
+            let mut inner_rect = None;
             if let Some(surface) = &pane.texture {
                 let inner = fit_rect(rect, surface.width() as u32, surface.height() as u32);
                 let _ = context.save();
@@ -969,7 +1480,7 @@ impl Viewer {
                 let _ = context.paint();
                 let _ = context.restore();
 
-                if self.cursor && !bsp {
+                if cursor && !bsp {
                     if let Some((x, y)) = pane.pointer {
                         let px = inner.x as f64
                             + x as f64 * inner.w as f64 / pane.target.width.max(1) as f64;
@@ -978,6 +1489,7 @@ impl Viewer {
                         draw_crosshair(context, px, py);
                     }
                 }
+                inner_rect = Some(inner);
             } else if let Some(error) = &pane.error {
                 draw_text(
                     context,
@@ -987,6 +1499,7 @@ impl Viewer {
                     COL_ERROR,
                 );
             }
+            pane.last_inner = inner_rect;
             let _ = context.restore();
 
             if bsp {

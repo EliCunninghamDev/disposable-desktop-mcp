@@ -31,7 +31,7 @@ wayland-backend = "0.3"
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-scanner = "0.31"
-x11rb = { version = "0.13", features = ["randr", "xfixes"] }
+x11rb = { version = "0.13", features = ["randr", "xfixes", "xtest"] }
 xkbcommon = "0.9.0"
 
 [profile.release]

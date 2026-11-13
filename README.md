@@ -50,8 +50,8 @@ used.
   the data-control protocol with a background owner. Session-scoped process/log
   tools make failed launches diagnosable.
 - **Runtime control.** XRandR resizing on Xephyr, EWMH window state changes,
-  held mouse/key input, persistent per-session HOME, and an auto-teardown
-  watchdog.
+  held mouse/key input, persistent per-session HOME, an auto-teardown watchdog,
+  and explicit agent/human input arbitration with `wait_for_control`.
 - **Trace and marks.** Every tool call is appended to
 `$XDG_RUNTIME_DIR/xephyr-mcp/traces/<session_id>.jsonl` with the sanitized
 arguments, duration, outcome, and before/after frame hashes for screen-changing
@@ -162,8 +162,19 @@ The toolbar contains:
 
 Selecting a session in BSP mode switches back to Single for that session.
 Keyboard shortcuts: `q`/`Esc` quit, `f`/`F11` fullscreen, `t` toggle BSP,
-`s` cycle sessions. The viewer is read-only; it never sends input into a nested
-desktop.
+`s` cycle sessions. The viewer is read-only by default. Press `c` or the
+**Control** toggle to claim human control: mouse, wheel, and keyboard events
+are then forwarded to the selected session (including `Esc`), the title shows
+`[HUMAN]`, and the MCP server refuses agent input until you press
+`Ctrl+Shift+C`, click **Control** again, or close the viewer. `Ctrl+Shift+Q`
+closes it while human control is active. Claims are tied to the viewer PID, so
+a crashed viewer cannot lock an agent out.
+
+Wayland sessions (including headless ones) are captured with the same
+screencopy path as the server and receive forwarded input through the virtual
+pointer/keyboard. A nested Wayland session parks its host input devices on a
+dummy seat while the agent owns it and moves them back only during human
+control.
 
 The window is aspect-ratio-locked in Single mode via `WM_NORMAL_HINTS` when it
 runs on X11 (the default when an X display is reachable). Content is always
@@ -227,7 +238,9 @@ tools return a clear error and the rest of the server keeps working.
 
 - Linux only. The X11 backend needs Xephyr or Xvfb; the Wayland backend needs
   sway. The viewer still needs a host X11/XWayland display.
-- The viewer is intentionally read-only; input passthrough is not implemented.
+- The viewer forwards input only after explicit human control; X11 host input
+  still reaches a visible Xephyr window directly, so use `visible=false` when
+  that matters.
 - `launch` runs arbitrary shell commands inside the nested desktop. Treat the
   MCP server as trusted local tooling.
 - Software rendering (GTK's Cairo renderer) is used automatically on hosts

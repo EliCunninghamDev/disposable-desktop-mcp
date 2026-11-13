@@ -288,6 +288,28 @@ impl Backend {
         }
     }
 
+    /// Rebuild a handle from a state file, for the viewer and status tools.
+    pub fn from_state(state: &crate::state::State) -> Self {
+        match state.backend.as_str() {
+            "wayland" => Self::Wayland {
+                runtime_dir: PathBuf::from(&state.runtime_dir),
+                display: state
+                    .wayland_display
+                    .clone()
+                    .unwrap_or_else(|| state.display.clone()),
+                swaysock: state
+                    .swaysock
+                    .clone()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(&state.runtime_dir).join("sway-ipc.sock")),
+                output: state.output_name.clone().unwrap_or_default(),
+            },
+            _ => Self::X11 {
+                display: state.display.clone(),
+            },
+        }
+    }
+
     pub fn kind(&self) -> BackendKind {
         match self {
             Self::X11 { .. } => BackendKind::X11,
@@ -624,6 +646,46 @@ impl Backend {
             .lock()
             .map_err(|_| anyhow!("the Wayland input state is poisoned"))?;
         guard.scroll(at, up, amount)
+    }
+
+    /// Forward a viewer key event by keysym.  X11 viewers use XTEST directly;
+    /// this path exists for the Wayland virtual keyboard.
+    /// Enable or disable host input in a nested session.  Wayland parks the
+    /// host devices on a dummy seat; headless sessions and X11 are no-ops.
+    pub fn set_host_input(&self, enabled: bool) -> Result<Value> {
+        match self {
+            Self::Wayland {
+                runtime_dir,
+                swaysock,
+                ..
+            } => {
+                let config = runtime_dir.join("sway").join("config");
+                let count = sway::set_host_input(swaysock, &config, enabled)?;
+                Ok(json!({
+                    "host_input": enabled,
+                    "seat": if enabled { "seat0" } else { "locked" },
+                    "devices": count,
+                }))
+            }
+            Self::X11 { .. } => Ok(json!({
+                "host_input": enabled,
+                "note": "X11 host input reaches a visible Xephyr window directly; use visible=false for strict isolation",
+            })),
+        }
+    }
+
+    pub fn key_sym(
+        &self,
+        keysym: u32,
+        modifiers: wl_input::Modifiers,
+        pressed: bool,
+    ) -> Result<Value> {
+        self.require_keyboard()?;
+        let input = self.wayland_input()?;
+        let mut guard = input
+            .lock()
+            .map_err(|_| anyhow!("the Wayland input state is poisoned"))?;
+        guard.key_sym(keysym, modifiers, pressed)
     }
 
     pub fn key_press(&self, combo: &str, delay_ms: u32) -> Result<Value> {

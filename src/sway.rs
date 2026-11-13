@@ -17,6 +17,7 @@ const RUN_COMMAND: u32 = 0;
 const GET_OUTPUTS: u32 = 3;
 const GET_TREE: u32 = 4;
 const GET_VERSION: u32 = 7;
+const GET_INPUTS: u32 = 100;
 
 /// Resolve the IPC socket from a private runtime directory.  Returns
 /// `(wayland socket name, sway IPC path)`.
@@ -106,6 +107,8 @@ pub fn config(runtime_dir: &Path, width: u32, height: u32, xwayland: bool) -> Re
     text.push_str("for_window [app_id=\".*\"] floating enable\n");
     text.push_str("for_window [class=\".*\"] floating enable\n");
     text.push_str("seat seat0 fallback true\n");
+    // Host input devices are parked here while the agent owns the session.
+    text.push_str("seat locked fallback false\n");
     if xwayland {
         // `force` starts Xwayland immediately instead of waiting for an X11
         // client, so the DISPLAY is available when launch returns.
@@ -177,6 +180,10 @@ impl Sway {
 
     pub fn get_outputs(&self) -> Result<Value> {
         self.json(GET_OUTPUTS, b"")
+    }
+
+    pub fn get_inputs(&self) -> Result<Value> {
+        self.json(GET_INPUTS, b"")
     }
 
     /// Run an IPC command and fail when sway reports an unsuccessful node.
@@ -479,6 +486,78 @@ pub fn action(socket: &Path, id: i64, action: &str) -> Result<Value> {
             "window_state {other:?} is not supported on the wayland backend; \
              use state, float, unfloat, fullscreen, or unfullscreen"
         ),
+    }
+}
+
+/// Host devices consumed by the nested compositor.  Virtual devices created by
+/// this server are named `wlr_virtual_*` and stay on seat0.
+pub fn host_input_ids(socket: &Path) -> Result<Vec<String>> {
+    let inputs = Sway::new(socket.to_path_buf()).get_inputs()?;
+    let list = inputs
+        .as_array()
+        .ok_or_else(|| anyhow!("sway returned a non-list for get_inputs"))?;
+    Ok(list
+        .iter()
+        .filter_map(|item| {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+            let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+            if name.starts_with("wlr_virtual_") || !matches!(kind, "pointer" | "keyboard" | "touch")
+            {
+                return None;
+            }
+            item.get("identifier")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect())
+}
+
+const HOST_INPUT_BEGIN: &str = "# xephyr-mcp host input begin";
+const HOST_INPUT_END: &str = "# xephyr-mcp host input end";
+
+/// Move every host input device to `seat0` (human) or the dummy `locked` seat
+/// (agent).  Sway's runtime `seat attach` is additive and is forgotten on
+/// reload, so the attachment is written into the generated config and the
+/// config is reloaded; that is what actually removes the device from the other
+/// seat.
+pub fn set_host_input(socket: &Path, config: &Path, enabled: bool) -> Result<usize> {
+    let mut text = std::fs::read_to_string(config)
+        .with_context(|| format!("cannot read {}", config.display()))?;
+    if let Some(begin) = text.find(HOST_INPUT_BEGIN) {
+        if let Some(end) = text[begin..].find(HOST_INPUT_END) {
+            let end = begin + end + HOST_INPUT_END.len();
+            text.replace_range(begin..end, "");
+        }
+    }
+    let ids = host_input_ids(socket)?;
+    if !ids.is_empty() {
+        let seat = if enabled { "seat0" } else { "locked" };
+        text.push_str(HOST_INPUT_BEGIN);
+        text.push_str(&format!("\nseat {seat} {{\n"));
+        for id in &ids {
+            text.push_str(&format!("    attach {id}\n"));
+        }
+        text.push_str("}\n");
+        text.push_str(HOST_INPUT_END);
+        text.push('\n');
+    }
+    std::fs::write(config, text).with_context(|| format!("cannot write {}", config.display()))?;
+    Sway::new(socket.to_path_buf()).run("reload")?;
+    Ok(ids.len())
+}
+
+/// Wait for the Wayland backend to publish its host devices, then park them on
+/// the dummy seat.  Headless sessions have none and return 0 without reloading.
+pub async fn lock_host_input(socket: &Path, config: &Path, timeout: Duration) -> Result<usize> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !host_input_ids(socket)?.is_empty() {
+            return set_host_input(socket, config, false);
+        }
+        if Instant::now() >= deadline {
+            return Ok(0);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

@@ -2,6 +2,7 @@
 //! accessibility bus, launched applications, and shutdown.
 
 use crate::backend::{Backend, BackendKind, Capabilities};
+use crate::control;
 use crate::env::{self, Tool};
 use crate::proc;
 use crate::state::{self, State};
@@ -138,6 +139,7 @@ impl SessionInfo {
     }
 
     pub fn to_json(&self) -> Value {
+        let control = control::effective(&self.session_id);
         let mut value = json!({
             "session_id": self.session_id,
             "display": self.display,
@@ -164,7 +166,9 @@ impl SessionInfo {
             "state_file": env::state_file().display().to_string(),
             "backend": self.backend.as_str(),
             "capabilities": self.capabilities(),
-            "control": "agent",
+            "control": control.owner.as_str(),
+            "control_pid": (control.owner == control::Owner::Human).then_some(control.pid),
+            "control_since": (control.owner == control::Owner::Human).then_some(control.since),
             "started_at": self.started_at,
         });
         if self.backend == BackendKind::Wayland {
@@ -180,6 +184,7 @@ impl SessionInfo {
     }
 
     fn state(&self) -> State {
+        let control = control::effective(&self.session_id);
         State {
             server_pid: std::process::id(),
             session_id: self.session_id.clone(),
@@ -205,9 +210,9 @@ impl SessionInfo {
             output_name: self.output_name.clone(),
             xwayland_display: self.xdisplay.clone(),
             capabilities: Some(self.capabilities()),
-            control: "agent".to_string(),
-            control_pid: None,
-            control_since: None,
+            control: control.owner.as_str().to_string(),
+            control_pid: (control.owner == control::Owner::Human).then_some(control.pid),
+            control_since: (control.owner == control::Owner::Human).then_some(control.since),
         }
     }
 }
@@ -264,6 +269,15 @@ impl Session {
 
     pub fn require_clipboard(&self) -> Result<()> {
         self.backend.require_clipboard()
+    }
+
+    /// Input and UI actions are refused while a person has control.
+    pub fn require_agent_control(&self) -> Result<()> {
+        control::require_agent(&self.info.session_id)
+    }
+
+    pub fn control(&self) -> control::Control {
+        control::effective(&self.info.session_id)
     }
 
     pub fn width(&self) -> u32 {
@@ -525,6 +539,9 @@ impl DisplayManager {
             }
         };
 
+        // A fresh session starts under agent control, even when the same
+        // session id was used before.
+        let _ = control::write(&session_id, &control::Control::agent());
         state::write(&info.state())?;
         write_marker(&info)?;
         let session = Arc::new(Session {
@@ -758,6 +775,18 @@ impl DisplayManager {
                 warnings.push(format!(
                     "sway started at {actual_width}x{actual_height} and the requested {width}x{height} mode failed: {err:#}"
                 ));
+            }
+        }
+
+        // Nested sessions receive host pointer/keyboard devices from the host
+        // compositor.  Park them on a dummy seat so watching the window does
+        // not let someone type into the agent's session; the viewer moves them
+        // back when it claims human control.
+        if host.is_some() {
+            if let Err(err) =
+                sway::lock_host_input(&swaysock, &config, Duration::from_secs(2)).await
+            {
+                warnings.push(format!("could not isolate host input: {err:#}"));
             }
         }
 
@@ -1060,6 +1089,7 @@ impl DisplayManager {
         // directory in their environment is a reliable last sweep.
         state::kill_runtime_dir(&info.runtime_dir);
 
+        control::clear(&info.session_id);
         state::clear(&info.session_id);
         let _ = std::fs::remove_dir_all(&info.runtime_dir);
 
