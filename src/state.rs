@@ -1,5 +1,6 @@
 //! Session state shared with the viewer, plus conservative stale cleanup.
 
+use crate::backend::Capabilities;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -8,6 +9,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Root-window property used by the viewer to discover a nested display when
 /// no state file is available.
 pub const ROOT_MARKER: &str = "_XEPHYR_MCP";
+
+fn default_backend() -> String {
+    "x11".to_string()
+}
+
+fn default_control() -> String {
+    "agent".to_string()
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct State {
@@ -29,6 +38,24 @@ pub struct State {
     pub pids: Vec<u32>,
     pub started_at: u64,
     pub version: String,
+    /// "x11" for existing sessions; "wayland" once that backend lands.
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    #[serde(default)]
+    pub wayland_display: Option<String>,
+    #[serde(default)]
+    pub swaysock: Option<String>,
+    #[serde(default)]
+    pub output_name: Option<String>,
+    #[serde(default)]
+    pub capabilities: Option<Capabilities>,
+    /// "agent" or "human"; viewer/session arbitration.
+    #[serde(default = "default_control")]
+    pub control: String,
+    #[serde(default)]
+    pub control_pid: Option<u32>,
+    #[serde(default)]
+    pub control_since: Option<u64>,
 }
 
 impl State {
@@ -257,4 +284,63 @@ pub fn cleanup_stale() -> Vec<String> {
 
 pub fn session_dir(number: u32, server_pid: u32) -> PathBuf {
     crate::env::shared_runtime_dir().join(format!("session-{number}-{server_pid}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_state_files_get_backend_defaults() {
+        let value = serde_json::json!({
+            "server_pid": 1,
+            "display": ":100",
+            "display_number": 100,
+            "width": 800,
+            "height": 600,
+            "visible": false,
+            "xserver": "Xvfb",
+            "wm": "openbox",
+            "runtime_dir": "/run/user/1000/xephyr-mcp/session-100-1",
+            "pids": [1, 2],
+            "started_at": 1,
+            "version": "0.1.0"
+        });
+        let state: State = serde_json::from_value(value).unwrap();
+        assert_eq!(state.backend, "x11");
+        assert_eq!(state.control, "agent");
+        assert!(state.wayland_display.is_none());
+        assert!(state.capabilities.is_none());
+    }
+
+    #[test]
+    fn wayland_state_round_trips_capabilities() {
+        let mut state: State = serde_json::from_value(serde_json::json!({
+            "server_pid": 1,
+            "display": "wayland-1",
+            "display_number": 0,
+            "width": 800,
+            "height": 600,
+            "visible": false,
+            "xserver": "sway",
+            "wm": null,
+            "runtime_dir": "/run/user/1000/xephyr-mcp/session-1-1",
+            "pids": [1],
+            "started_at": 1,
+            "version": "0.1.0"
+        }))
+        .unwrap();
+        state.backend = "wayland".into();
+        state.wayland_display = Some("wayland-1".into());
+        state.swaysock = Some("/run/user/1000/xephyr-mcp/session-1-1/sway-ipc.1000.1.sock".into());
+        state.output_name = Some("HEADLESS-1".into());
+        state.capabilities = Some(crate::backend::Capabilities::wayland());
+        let encoded = serde_json::to_string(&state).unwrap();
+        let decoded: State = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.backend, "wayland");
+        assert_eq!(
+            decoded.capabilities.unwrap().clipboard,
+            crate::backend::ClipboardPath::DataControl
+        );
+    }
 }

@@ -7,6 +7,7 @@
 //! management paths.
 
 pub mod a11y;
+pub mod backend;
 pub mod clipboard;
 pub mod display;
 pub mod env;

@@ -146,6 +146,9 @@ impl SessionInfo {
             "persistent_home": self.persistent_home,
             "trace": crate::trace::session_path(&self.session_id).display().to_string(),
             "state_file": env::state_file().display().to_string(),
+            "backend": "x11",
+            "capabilities": crate::backend::Capabilities::x11(),
+            "control": "agent",
             "started_at": self.started_at,
         })
     }
@@ -167,6 +170,14 @@ impl SessionInfo {
             pids: self.pids(),
             started_at: self.started_at,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            backend: "x11".to_string(),
+            wayland_display: None,
+            swaysock: None,
+            output_name: None,
+            capabilities: Some(crate::backend::Capabilities::x11()),
+            control: "agent".to_string(),
+            control_pid: None,
+            control_since: None,
         }
     }
 }

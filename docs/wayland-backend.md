@@ -1,6 +1,8 @@
 # Wayland backend
 
-Status: design, validated against sway 1.12 + wlroots 0.20 (2026-11-13).
+Status: design validated against sway 1.12 + wlroots 0.20 (2026-11-13).
+The backend-neutral state/capability schema has landed; the Wayland backend is
+not wired into the tools yet.
 
 The X11 backend stays the default. This document describes the seam that lets a
 Wayland session exist beside it, the protocol mapping, and the parts of the
@@ -53,6 +55,8 @@ pub trait Launcher: Send + Sync {
     async fn start(&self, spec: &DisplaySpec) -> Result<Started>;
     async fn stop(&self, started: &Started) -> Result<()>;
 }
+pub enum MoveResize { Any, FloatingOnly, None }
+pub enum ClipboardPath { X11Selection, DataControl, None }
 ```
 
 `WinId` should be opaque (`x11:0x400003` / `wl:<toplevel-uuid>`), not `u32`.
@@ -60,17 +64,18 @@ Keep accepting bare X11 ids for compatibility and echo the backend in responses.
 
 ```rust
 pub struct Capabilities {
+    pub move_resize: MoveResize,          // Any | FloatingOnly | None
+    pub resize_display: bool,             // true on sway headless and nested
+    pub capture_window: bool,             // false until toplevel capture is wired
+    pub clipboard: ClipboardPath,         // X11Selection | DataControl | None
+    pub precise_geometry: bool,
+    // Extra, for clearer tool errors and UI hints:
     pub capture_output: bool,
-    pub capture_window: bool,
     pub pointer: bool,
     pub keyboard: bool,
-    pub clipboard: bool,
     pub window_list: bool,
     pub window_activate: bool,
     pub window_close: bool,
-    pub move_resize: MoveResize,      // Full | FloatingOnly | None
-    pub resize_display: bool,
-    pub precise_client_geometry: bool,
     pub visible_host_window: bool,
 }
 ```
@@ -95,9 +100,29 @@ Differences:
 | Capture | `GetImage` | `wlr-screencopy` (or `ext-image-copy-capture`) |
 | Clipboard | in-process selection owner | `ext/wlr-data-control` |
 
-XWayland is optional. It gives X11-only test apps a `DISPLAY`, but input still
-goes through the Wayland virtual devices, so XTEST is not used for Wayland
-sessions even when XWayland is on.
+XWayland is optional and defaults to **disabled**. It creates a socket in
+`/tmp/.X11-unix`, a host-global namespace, which weakens the isolation story;
+enable it explicitly for X11-only test apps. Input still goes through the
+Wayland virtual devices, so XTEST is not used for Wayland sessions even when
+XWayland is on.
+
+### Generated sway config
+
+```text
+output * mode 1280x900
+default_border none
+for_window [app_id=".*"] floating enable
+for_window [class=".*"] floating enable
+xwayland disable
+```
+
+Floating-by-default matches the openbox model the agent already expects: real
+positions, no reflow of other windows, and `move_resize_window` works on most
+windows. The cost is that tiling is no longer the default. Dialogs are floating
+anyway; without these rules most windows are tiled and cannot be placed. The
+`class` rule covers XWayland clients when that is enabled. `default_border none`
+also makes the compositor rect equal the client rect, which the a11y origin
+calculation relies on.
 
 ## Verified protocol support
 
@@ -171,15 +196,20 @@ coordinates. A tiled alacritty was 1280x720 at 0,0. After `floating enable`,
 
 Consequences:
 
-- `Capabilities::move_resize` is `FloatingOnly` for sway.
-- `move_resize_window` must either (a) require `floating=true`, or (b) opt into
-  floating first and report that it changed layout. Default to an explicit
-  error for tiled windows rather than silently reflowing the desktop.
+- `Capabilities::move_resize` is `FloatingOnly` for sway. With the generated
+  `for_window` rules most windows are floating; a genuinely tiled window still
+  gets an explicit `not_supported` error rather than silently reflowing the
+  desktop.
+- Confirm instead of sleeping. `resize set` is only real after the client
+  commits the new size, so poll `get_tree` (or watch the window event) until
+  the rect matches or a timeout expires. Then send `move position`, and return
+  both the requested and the actual rect. If the client clamps to a minimum
+  size, the caller sees `requested` and `result` side by side.
 - Issue `resize set` and `move position` as separate IPC commands. In one
   command list, sway computed the position against the new size: asking for
   `move position 100 80` with a 400x300 resize yielded `(300, 230)`. Separate
-  commands with a short settle gave `(100, 80)`. `move absolute position`
-  also works.
+  commands with confirmation gave `(100, 80)`. `move absolute position` also
+  works.
 
 ### Window list has two halves
 
@@ -189,16 +219,34 @@ workspace. Match by `(app_id, pid)`; titles are not unique.
 
 `precise_client_geometry` is false: the compositor rect is exact, but clients
 cannot report screen-absolute widget coordinates. AT-SPI under Wayland remains
-window-relative/unreliable for GTK4, exactly as it is on X11 today; the
-compositor origin from sway must be added to the a11y fallback.
+window-relative/unreliable for GTK4, exactly as it is on X11 today. Request
+extents window-relative and add `rect.x + window_rect.x` from sway's tree, not
+just `rect.x`, because `rect` includes decorations. With `default_border none`
+the two are equal, which is another reason to set it.
 
 ### Clipboard is not covered by the X11 selection owner
 
 Sway advertises both `ext_data_control_manager_v1` and
 `zwlr_data_control_manager_v1`. Implement data-control for Wayland sessions.
-With XWayland enabled, X11 and Wayland clipboards are separate unless bridged;
-decide which one is authoritative (data-control) and document the split. This
-is the one tool group missing from the original mapping.
+With XWayland enabled, data-control is authoritative; the X11 selection is
+bridged only under the focus condition below.
+
+The XWayland bridge was tested directly (sway 1.12/wlroots 0.20, xclip +
+wl-copy, `xwayland force`):
+
+- With no X11 window focused, the log says
+  `not handling selection events: no seat assigned to xwayland`, and neither
+  direction works. A headless session with no X11 app therefore has no bridge.
+- With an X11 view focused (`xmessage`), both directions work:
+  `wl-copy` → `xclip -o` returned the Wayland text, and `xclip -i` → `wl-paste`
+  returned the X11 text.
+
+The reason is in sway's `seat.c`: `wlr_xwayland_set_seat()` is called when an
+X11 view gains focus, not at XWayland startup. Until that happens wlroots'
+xwm has no seat and ignores selections. If `xwayland=true`, either warm the
+bridge by focusing an X11 window once, or document that XWayland clipboard
+interop starts with the first focused X11 app. Default `xwayland` to false, as
+proposed; that keeps the clipboard path purely Wayland.
 
 ### Per-window capture is possible, but not via grim
 
@@ -210,20 +258,48 @@ sway rect (wrong when occluded) or return `capture_window: false`.
 ### Input passthrough and the nested window
 
 A nested sway/Xephyr window is a real host window and receives host input
-directly. The server cannot intercept that path. Therefore:
+directly. The server cannot intercept that path. The first idea — use
+`swaymsg input <identifier> events disabled` — does **not** work: sway's
+`input events` command returns early for any device that is not libinput
+(`wlr_input_device_is_libinput()`), and the wayland-backend devices do not even
+expose `send_events` in `get_inputs`. The command reports success and changes
+nothing.
 
-- In **headless** mode, the viewer is the only input path, so a control lock can
-  genuinely arbitrate: the viewer forwards events only in `human` mode, and the
-  server refuses input tools in `human` mode.
-- In **nested** mode, the host window keeps accepting input regardless of the
-  lock. The lock only prevents the viewer from injecting and the agent from
-  calling tools; a human at the host window is still unarbitrated. If real
-  arbitration is required, use headless + viewer, or accept the same advisory
-  model Xephyr has today.
+There is a working mechanism: move the backend-fed devices to a dummy seat.
 
-Do not use ydotool/uinput in either mode. uinput enters the host input stack and
-breaks the isolation invariant. The virtual protocols are scoped to the private
-compositor.
+```
+swaymsg seat locked attach 0:0:wayland-pointer-seat0
+swaymsg seat locked attach 0:0:wayland-keyboard-seat0
+```
+
+Measured in a two-layer setup (headless/nested A, nested B):
+
+- Before: `seat0` had the pointer and keyboard; `get_inputs` reported
+  `0:0:wayland-{pointer,keyboard}-seat0`.
+- After both attaches: `get_seats` showed `locked` with both devices and
+  `seat0` with `capabilities: 0` and `devices: []`.
+- The virtual keyboard still typed into the focused client on `seat0`
+  (`wtype` against B kept working), so the agent path is unaffected.
+- Release is the inverse: `seat seat0 attach <identifier>`.
+
+This is structural rather than advisory: once the host devices belong to a seat
+with no focused output/client, their events cannot reach `seat0` clients. The
+two-layer test could not observe host-fed key delivery in the first place (the
+nested window did not accept the parent's virtual keyboard), so the block
+itself was not observed end-to-end; the device-to-seat removal was. Verify with
+a real host pointer/keyboard before calling it a hard guarantee.
+
+Consequences:
+
+- In **nested** mode the lock can be enforced by moving the wayland-backend
+  devices to `locked` and back, with a re-scan for hotplugged identifiers.
+  The viewer is not required for human input in this mode.
+- In **headless** mode there are no backend-fed devices; the viewer is the only
+  input path, so the viewer-side lock remains the mechanism.
+- Still never use ydotool/uinput. uinput enters the host input stack and breaks
+  the isolation invariant.
+- The lock is advisory against a hostile same-user process, not a security
+  boundary.
 
 ### Cursor capture
 
@@ -261,23 +337,39 @@ DISPLAY=<nested XWayland display>   # only when xwayland=true
 Remove host `WAYLAND_DISPLAY`, `DISPLAY`, `SWAYSOCK`, `HYPRLAND_INSTANCE_SIGNATURE`,
 and `I3SOCK` before applying these.
 
-## State and viewer
+## State and discovery
 
-Add to `State` (serde defaults preserve old files):
+Treat the socket name as recorded data. Add to `State` (serde defaults preserve
+old files):
 
 ```rust
-backend: String,              // "x11" | "wayland"
-wayland_display: Option<String>,
-sway_socket: Option<String>,
-control: String,              // "agent" | "human"
+backend: String,                    // "x11" | "wayland"
+wayland_display: Option<String>,    // relative name, e.g. "wayland-1"
+swaysock: Option<String>,           // absolute sway IPC socket
+output_name: Option<String>,        // HEADLESS-1 / WL-1 / X11-1
+capabilities: Option<serde_json::Value>,
+control: String,                    // "agent" | "human"
 control_pid: Option<u32>,
 control_since: Option<u64>,
 ```
 
 Keep `display` for the human-readable name (`:100` or `wayland-1`). The viewer
 uses the state file, not the X11 root marker. Also write a marker file next to
-the socket (`$XDG_RUNTIME_DIR/xephyr-mcp-session.json`) for discovery when the
-shared state directory is unavailable. Aspect-lock hints stay best-effort.
+the socket (`$XDG_RUNTIME_DIR/xephyr-mcp-session.json`) with the same JSON, for
+discovery when the shared state directory is unavailable. Aspect-lock hints
+stay best-effort.
+
+Discovery is a glob in the private runtime directory: `wayland-*` (excluding
+`.lock`) and `sway-ipc.*.sock`. Poll until (a) the Wayland socket accepts a
+connection and (b) `get_version` answers over IPC. Sway has no readiness fd and
+there is no `-displayfd` analog to build. Because the runtime directory is
+private, there is no race with another session.
+
+Child environment: the server sets `WAYLAND_DISPLAY=<recorded name>` with the
+private `XDG_RUNTIME_DIR` and keeps its `env_clear()` model. Launch apps from
+the server, not via `sway exec`, so the absolute host socket path and host
+`DISPLAY` never reach app environments. Only the sway process itself sees the
+host path (and host `DISPLAY`/`XAUTHORITY` for `WLR_BACKENDS=x11`).
 
 ## Phases
 
@@ -291,12 +383,15 @@ shared state directory is unavailable. Aspect-lock hints stay best-effort.
    existing fit/resize/PNG code. `display_start backend=wayland` (headless
    first), `resize_display` via output mode.
 3. **Wayland windows and input.** Sway IPC `get_tree`, foreign-toplevel list,
-   activate/close, floating-only move/resize, virtual pointer and keyboard,
-   data-control clipboard. Add the `xwayland` option and launch env.
+   activate/close, floating-only move/resize with confirmation polling,
+   virtual pointer and keyboard, data-control clipboard. Add the `xwayland`
+   option (default off), launch env, and the XWayland bridge warm-up decision.
 4. **Viewer + control.** Screencopy client, state-based discovery, `c` toggle,
    `control` in state, server-side input refusal, `wait_for_control`, no trace
-   screenshots during human control, optional blank/redacted capture. Document
-   the nested-window limitation.
+   screenshots during human control, optional blank/redacted capture. For
+   nested sessions, enforce the lock by attaching the wayland-backend devices
+   to a `locked` seat (and reattaching on release); for headless sessions, use
+   viewer forwarding.
 5. **Polish.** Nested mode on both host types, per-window capture via
    `ext-foreign-toplevel-image-capture-source`, labwc support or an explicit
    capability error, packaging, docs, smoke tests in CI.
@@ -312,8 +407,13 @@ shared state directory is unavailable. Aspect-lock hints stay best-effort.
   no `/dev/uinput` access; private bus and AT-SPI only.
 - XWayland: X11-only app gets the nested `DISPLAY`; killing the session removes
   Xwayland and its socket.
-- Clipboard: Wayland-native roundtrip; XWayland roundtrip; no host clipboard
-  read/write.
+- Clipboard: Wayland-native roundtrip; XWayland roundtrip after an X11 view is
+  focused; no host clipboard read/write. Confirm that a headless session with
+  no X11 window has no XWayland bridge (expected).
+- Control lock: nested — attach the wayland devices to `locked`, verify host
+  input stops and virtual input still works; detach and verify host input
+  resumes. Headless — viewer forwards only in `human` mode and the server
+  refuses input tools.
 - A11y: tree/find/action on a GTK app; coordinate fallback adds the compositor
   origin and reports `geometry_precise: false`.
 - Regression: all existing X11 tools and response shapes unchanged.
