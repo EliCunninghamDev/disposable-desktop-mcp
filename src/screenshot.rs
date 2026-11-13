@@ -8,6 +8,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, ImageFormat};
 use x11rb::rust_connection::RustConnection;
 
+#[derive(Clone)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
@@ -313,6 +314,28 @@ pub fn crop(frame: &Frame, x: u32, y: u32, width: u32, height: u32) -> Result<Fr
         height,
         rgba,
     })
+}
+
+/// Crop a captured toplevel to the compositor's window geometry.
+///
+/// The foreign-toplevel capture source returns the client surface, which for
+/// client-side-decorated toolkits includes symmetric shadow margins around the
+/// window geometry that sway reports.  Removing the margins keeps the image
+/// origin aligned with `list_windows` coordinates (and with X11 capture).
+/// Returns the cropped frame and the removed left/top margin.
+pub fn crop_centered(frame: &Frame, width: u32, height: u32) -> Result<(Frame, u32, u32)> {
+    if width == 0 || height == 0 {
+        return Err(anyhow!("window geometry is empty"));
+    }
+    let width = width.min(frame.width);
+    let height = height.min(frame.height);
+    let left = (frame.width - width) / 2;
+    let top = (frame.height - height) / 2;
+    if left == 0 && top == 0 && width == frame.width && height == frame.height {
+        return Ok((frame.clone(), 0, 0));
+    }
+    let cropped = crop(frame, left, top, width, height)?;
+    Ok((cropped, left, top))
 }
 
 /// Cheap content hash used by the wait tools.  FNV-1a is fast enough to run
@@ -719,5 +742,44 @@ mod tests {
         let before = hash(&other);
         other.rgba[0] ^= 0xff;
         assert_ne!(before, hash(&other));
+    }
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+
+    fn frame(width: u32, height: u32) -> Frame {
+        Frame {
+            width,
+            height,
+            rgba: vec![7; (width * height * 4) as usize],
+        }
+    }
+
+    #[test]
+    fn crop_centered_removes_shadow_margins() {
+        let (out, left, top) = crop_centered(&frame(344, 307), 300, 263).unwrap();
+        assert_eq!((out.width, out.height), (300, 263));
+        assert_eq!((left, top), (22, 22));
+    }
+
+    #[test]
+    fn crop_centered_is_a_noop_when_sizes_match() {
+        let (out, left, top) = crop_centered(&frame(300, 263), 300, 263).unwrap();
+        assert_eq!((out.width, out.height), (300, 263));
+        assert_eq!((left, top), (0, 0));
+    }
+
+    #[test]
+    fn crop_centered_clamps_to_the_frame() {
+        let (out, left, top) = crop_centered(&frame(100, 80), 300, 263).unwrap();
+        assert_eq!((out.width, out.height), (100, 80));
+        assert_eq!((left, top), (0, 0));
+    }
+
+    #[test]
+    fn crop_centered_rejects_empty_geometry() {
+        assert!(crop_centered(&frame(10, 10), 0, 10).is_err());
     }
 }

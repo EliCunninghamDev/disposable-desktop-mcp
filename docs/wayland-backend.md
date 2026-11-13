@@ -67,7 +67,7 @@ Keep accepting bare X11 ids for compatibility and echo the backend in responses.
 pub struct Capabilities {
     pub move_resize: MoveResize,          // Any | FloatingOnly | None
     pub resize_display: bool,             // true on sway headless and nested
-    pub capture_window: bool,             // false until toplevel capture is wired
+    pub capture_window: bool,             // true: foreign-toplevel + image-copy-capture
     pub clipboard: ClipboardPath,         // X11Selection | DataControl | None
     pub precise_geometry: bool,
     // Extra, for clearer tool errors and UI hints:
@@ -98,7 +98,7 @@ Differences:
 | Window list | EWMH | `wlr-foreign-toplevel-management` + sway IPC |
 | Geometry | EWMH/`GetGeometry` | sway IPC `get_tree` rects |
 | Resize | RandR | `output <name> mode <w>x<h>` |
-| Capture | `GetImage` | `wlr-screencopy` (or `ext-image-copy-capture`) |
+| Capture | `GetImage` | outputs: `wlr-screencopy`; windows: `ext-image-copy-capture` |
 | Clipboard | in-process selection owner | `ext/wlr-data-control` |
 
 XWayland is optional and defaults to **disabled**. It creates a socket in
@@ -149,10 +149,11 @@ zwp_virtual_keyboard_manager_v1
 zwlr_output_manager_v1
 ```
 
-So the mapping is feasible. Prefer `wlr-screencopy` for the first Rust
-implementation: it is simpler (shm buffer + `copy`/`ready`) and is in
-`wayland-protocols-wlr`. Keep `ext-image-copy-capture` for a second pass and
-for per-window capture via `ext_foreign_toplevel_image_capture_source`.
+So the mapping is feasible. Outputs use `wlr-screencopy` (shm buffer +
+`copy`/`ready`). Windows use `ext-foreign-toplevel-list-v1` to resolve sway's
+`foreign_toplevel_identifier`, `ext_foreign_toplevel_image_capture_source_v1`
+to make a source for that handle, and `ext-image-copy-capture-v1` to copy it
+into `wl_shm`.
 
 Nested mode was also verified under both host types: `WLR_BACKENDS=wayland`
 brings up `WL-1`, and `WLR_BACKENDS=x11` on `DISPLAY=:0` brings up `X11-1`.
@@ -257,12 +258,21 @@ bridge by focusing an X11 window once, or document that XWayland clipboard
 interop starts with the first focused X11 app. Default `xwayland` to false, as
 proposed; that keeps the clipboard path purely Wayland.
 
-### Per-window capture is possible, but not via grim
+### Per-window capture
 
-`grim` only captures outputs. `ext_foreign_toplevel_image_capture_source` is
-present, so `screenshot window=...` can capture a single toplevel without
-overlap problems. Until that is implemented, either crop the output using the
-sway rect (wrong when occluded) or return `capture_window: false`.
+`grim` only captures outputs; `screenshot window_id=` uses the ext protocols
+instead. `ext-foreign-toplevel-list-v1` is bound, its `stop`/`finished` handshake
+collects the initial toplevel batch, and sway's `foreign_toplevel_identifier`
+from `get_tree` selects the handle. The capture source then targets that handle,
+so an overlapping window does not appear in the image.
+
+The source returns the client surface, which for client-side-decorated toolkits
+(GTK, Qt) includes symmetric shadow margins: a 300x263 zenity window captures as
+344x307 with 22 px on each side. `list_windows` reports the window geometry, so
+the backend center-crops the frame back to that geometry before returning it.
+The origin therefore stays `(window.x, window.y)`, and marks/click coordinates
+line up with the image. Clients without shadows (alacritty, XWayland) need no
+crop. Cursors are not composited into window captures (`cursor_drawn: false`).
 
 ### Input passthrough and the nested window
 
@@ -437,10 +447,11 @@ Headless sessions have no host devices and rely on viewer forwarding.
    `locked` seat while the agent works, then rewrite the seat attachments and
    reload sway when human control starts; headless sessions use viewer
    forwarding. **Remaining:** optional blank/redacted capture.
-5. **Polish.** **Planned.** Per-window capture via
-   `ext-foreign-toplevel-image-capture-source`, labwc support or an explicit
-   capability error, packaging, docs, smoke tests in CI. Nested mode is
-   already validated on both host surfaces.
+5. **Polish.** ✅ Per-window capture via
+   `ext-foreign-toplevel-image-capture-source` + `ext-image-copy-capture`,
+   including overlap-free capture and geometry cropping. **Remaining:** labwc
+   support (or an explicit capability error), packaging, and smoke tests in
+   CI. Nested mode is already validated on both host surfaces.
 
 ## Acceptance tests
 
@@ -462,4 +473,7 @@ Headless sessions have no host devices and rely on viewer forwarding.
   refuses input tools.
 - A11y: tree/find/action on a GTK app; coordinate fallback adds the compositor
   origin and reports `geometry_precise: false`.
+- Per-window capture: `screenshot window_id=<wl:id>` matches the sway rect
+  exactly for native CSD and XWayland clients, excludes an overlapping window,
+  keeps marks aligned, and returns a clear error after the window closes.
 - Regression: all existing X11 tools and response shapes unchanged.

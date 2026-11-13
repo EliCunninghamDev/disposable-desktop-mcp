@@ -105,6 +105,10 @@ Implemented on this backend:
   `display_stop` via the sway IPC `exit` command plus the process-group sweep;
 - output capture through `wlr-screencopy-v1` into `wl_shm`, with the existing
   crop/resize/PNG and cursor/grid/marks overlays;
+- per-window capture through `ext-foreign-toplevel-list-v1`,
+  `ext-foreign-toplevel-image-capture-source-v1`, and
+  `ext-image-copy-capture-v1`, so an occluded window is captured without the
+  windows above it and the image matches the sway rect;
 - `list_windows`, `focus_window`, `close_window`, and `window_state` through
   sway IPC; geometry is exact for the compositor rect;
 - `move_resize_window` for floating windows, with separate resize/move commands

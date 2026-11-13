@@ -90,8 +90,8 @@ pub fn definitions() -> Vec<Value> {
                         "required": ["x", "y", "width", "height"],
                         "additionalProperties": false
                     },
-                    "window_id": { "description": "Capture this window instead of the root (id from list_windows)", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
-                    "cursor": { "type": "boolean", "description": "Overlay the nested pointer using XFixes (default false)" },
+                    "window_id": { "description": "Capture this window instead of the root (id from list_windows; opaque x11:/wl: handles and bare X11 ids are accepted)", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
+                    "cursor": { "type": "boolean", "description": "Overlay the nested pointer where the backend supports it (X11 XFixes, Wayland output capture); window captures report cursor_drawn=false (default false)" },
                     "grid": { "type": "boolean", "description": "Overlay a 100 px coordinate grid (default false)" },
                     "marks": { "type": "boolean", "description": "Draw numbered boxes around actionable accessibility elements and record their centers for click(mark=N) (default false)" },
                     "mark_limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Maximum numbered elements when marks=true (default 60)" },

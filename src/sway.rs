@@ -224,6 +224,8 @@ pub struct SwayWindow {
     pub floating: bool,
     pub visible: bool,
     pub workspace: Option<String>,
+    /// Sway's ext-foreign-toplevel identifier, used for per-window capture.
+    pub foreign_toplevel_identifier: Option<String>,
     pub stack: usize,
 }
 
@@ -324,6 +326,11 @@ fn walk(node: &Value, workspace: Option<&str>, stack: &mut usize, out: &mut Vec<
             floating,
             visible: node.get("visible").and_then(Value::as_bool).unwrap_or(true),
             workspace: workspace.map(str::to_string),
+            foreign_toplevel_identifier: node
+                .get("foreign_toplevel_identifier")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
             stack: *stack,
         });
         *stack += 1;

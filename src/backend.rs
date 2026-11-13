@@ -87,14 +87,14 @@ impl Capabilities {
         }
     }
 
-    /// A sway session.  Output capture, sway IPC window control, display
-    /// resize, and virtual-device input are implemented.  The data-control
-    /// clipboard is still reported honestly as unavailable.
+    /// A sway session.  Output and toplevel capture, sway IPC window control,
+    /// display resize, virtual-device input, and the data-control clipboard
+    /// are implemented.
     pub const fn wayland() -> Self {
         Self {
             move_resize: MoveResize::FloatingOnly,
             resize_display: true,
-            capture_window: false,
+            capture_window: true,
             clipboard: ClipboardPath::DataControl,
             precise_geometry: false,
             capture_output: true,
@@ -399,27 +399,52 @@ impl Backend {
                 Self::Wayland {
                     runtime_dir,
                     display,
+                    swaysock,
                     ..
                 },
                 target,
             ) => {
-                if matches!(target, CaptureTarget::Window(_)) {
-                    return Err(self.capability_error("per-window capture"));
-                }
-                let frame = wayland::capture(runtime_dir, display, Some(self.output()), cursor)?;
-                let frame = match target {
-                    CaptureTarget::Output => frame,
-                    CaptureTarget::Region(rect) => screenshot::crop(
-                        &frame,
-                        rect.x.max(0) as u32,
-                        rect.y.max(0) as u32,
-                        rect.width,
-                        rect.height,
-                    )?,
-                    CaptureTarget::Window(_) => unreachable!(),
+                let (frame, cursor_drawn) = match target {
+                    CaptureTarget::Output => (
+                        wayland::capture(runtime_dir, display, Some(self.output()), cursor)?,
+                        cursor,
+                    ),
+                    CaptureTarget::Region(rect) => (
+                        screenshot::crop(
+                            &wayland::capture(runtime_dir, display, Some(self.output()), cursor)?,
+                            rect.x.max(0) as u32,
+                            rect.y.max(0) as u32,
+                            rect.width,
+                            rect.height,
+                        )?,
+                        cursor,
+                    ),
+                    CaptureTarget::Window(handle) => {
+                        let id = handle.wayland_number().ok_or_else(|| {
+                            anyhow!("{} is not a sway window handle", handle.as_str())
+                        })?;
+                        let window = sway::find_window(swaysock, id)?;
+                        let frame = wayland::capture_toplevel(
+                            runtime_dir,
+                            display,
+                            window.foreign_toplevel_identifier.as_deref(),
+                            window.app_id.as_deref(),
+                            Some(&window.title),
+                        )?;
+                        // The foreign-toplevel source includes client-side
+                        // shadow margins, while sway's rect is the window
+                        // geometry.  Crop to the geometry so coordinates and
+                        // the image agree with list_windows and X11 capture.
+                        let (frame, _, _) = screenshot::crop_centered(
+                            &frame,
+                            window.width.max(1) as u32,
+                            window.height.max(1) as u32,
+                        )?;
+                        (frame, false)
+                    }
                 };
                 Ok(CaptureResult {
-                    cursor_drawn: cursor,
+                    cursor_drawn,
                     cursor_method: None,
                     frame,
                 })
@@ -444,8 +469,12 @@ impl Backend {
                     .ok_or_else(|| anyhow!("{} is not an X11 window handle", handle.as_str()))?;
                 Ok(Some(screenshot::window_origin(display, id)?))
             }
-            (Self::Wayland { .. }, CaptureTarget::Window(_)) => {
-                Err(self.capability_error("per-window capture"))
+            (Self::Wayland { swaysock, .. }, CaptureTarget::Window(handle)) => {
+                let id = handle
+                    .wayland_number()
+                    .ok_or_else(|| anyhow!("{} is not a sway window handle", handle.as_str()))?;
+                let window = sway::find_window(swaysock, id)?;
+                Ok(Some((window.x, window.y)))
             }
         }
     }
@@ -758,7 +787,7 @@ mod tests {
         let caps = Capabilities::wayland();
         assert_eq!(caps.move_resize, MoveResize::FloatingOnly);
         assert_eq!(caps.clipboard, ClipboardPath::DataControl);
-        assert!(!caps.capture_window);
+        assert!(caps.capture_window);
         assert!(!caps.precise_geometry);
         assert!(caps.pointer);
         assert!(caps.keyboard);
