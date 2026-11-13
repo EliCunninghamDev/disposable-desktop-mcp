@@ -16,7 +16,7 @@ pub fn definitions() -> Vec<Value> {
     vec![
         tool(
             "display_start",
-            "Start a disposable nested X display. visible=true launches Xephyr (a real window you can watch) on the host X11/XWayland display; visible=false launches headless Xvfb. Also starts a window manager and a private D-Bus session so launched apps cannot reach the host session bus. Only one display can run at a time; call display_stop first.",
+            "Start the private desktop. Call this before any other xephyr-mcp tool. visible=true launches Xephyr (a watchable window) on the host X11/XWayland display; visible=false launches headless Xvfb. Also starts a window manager and private D-Bus/AT-SPI buses so launched apps cannot reach the host session bus. Each server process owns one display: call display_stop before starting another, or run separate server instances with distinct session_id values for parallel desktops. Returns display, pids, dbus_address, runtime/log dirs, and accessibility status.",
             schema(
                 json!({
                     "width": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Screen width in pixels (default 1280)" },
@@ -34,7 +34,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "launch",
-            "Launch a process inside the nested display with a scrubbed environment (nested DISPLAY/XAUTHORITY/D-Bus/XDG_RUNTIME_DIR, no WAYLAND_DISPLAY). Returns the PID and log file. The command is run through 'sh -c', so shell syntax and pipelines work. Use wait_ms to detect immediate crashes.",
+            "Launch an application or shell command inside the nested display. The binary comes from the host filesystem, but DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR, and the session/accessibility buses point at the private desktop; WAYLAND_DISPLAY is removed. Uses 'sh -c', so pipelines and quoting work. Returns the PID and log file path. Use wait_ms to detect immediate crashes and read the log for startup errors.",
             schema(
                 json!({
                     "command": { "type": "string", "description": "Shell command to run, e.g. 'zenity --info --text hello' or 'xterm -e top'" },
