@@ -1459,6 +1459,9 @@ impl Viewer {
                 self.finish_stop(&pending);
             }
             Some(_) if Instant::now() >= pending.deadline => {
+                // Never leave a request that could stop the session after this
+                // viewer has given up on it.
+                state::take_stop_request(&pending.session_id);
                 self.pending_stop = None;
                 self.sync_buttons();
                 self.update_title();
