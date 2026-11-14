@@ -350,12 +350,13 @@ pub fn hash(frame: &Frame) -> u64 {
     value
 }
 
-/// Cursor overlay source.  XFixes gives the real cursor image; some minimal
-/// servers (notably Xvfb) reject `GetCursorImage`, in which case a high
-/// contrast crosshair at the pointer position is drawn instead.
+/// How the pointer was placed in a capture.  XFixes is the server's real
+/// cursor image; Image is the vendored Posy arrow; Crosshair is the
+/// last-resort marker used if the image cannot be drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorMethod {
     Xfixes,
+    Image,
     Crosshair,
 }
 
@@ -373,7 +374,7 @@ pub fn overlay_cursor(
     if let Ok(cookie) = x11rb::protocol::xfixes::get_cursor_image(&conn) {
         if let Ok(reply) = cookie.reply() {
             if reply.width == 0 || reply.height == 0 || reply.cursor_image.is_empty() {
-                return fallback_crosshair(&conn, frame, origin_x, origin_y);
+                return fallback_cursor(&conn, frame, origin_x, origin_y);
             }
             let cursor_width = i32::from(reply.width);
             let base_x = i32::from(reply.x) - i32::from(reply.xhot) - origin_x;
@@ -404,17 +405,17 @@ pub fn overlay_cursor(
                 return Ok(Some(CursorMethod::Xfixes));
             }
             // The cursor image was reported at a position outside the frame
-            // (common for window captures).  A crosshair is only drawn when
-            // the queried pointer is actually inside, which also keeps
+            // (common for window captures).  A pointer is only drawn when the
+            // queried position is actually inside, which also keeps
             // cursor_drawn honest.
-            return fallback_crosshair(&conn, frame, origin_x, origin_y);
+            return fallback_cursor(&conn, frame, origin_x, origin_y);
         }
     }
 
-    fallback_crosshair(&conn, frame, origin_x, origin_y)
+    fallback_cursor(&conn, frame, origin_x, origin_y)
 }
 
-fn fallback_crosshair(
+fn fallback_cursor(
     conn: &RustConnection,
     frame: &mut Frame,
     origin_x: i32,
@@ -424,16 +425,62 @@ fn fallback_crosshair(
     let pointer = conn.query_pointer(root)?.reply()?;
     let x = i32::from(pointer.root_x) - origin_x;
     let y = i32::from(pointer.root_y) - origin_y;
-    if !draw_crosshair(frame, x, y) {
-        return Ok(None);
-    }
-    Ok(Some(CursorMethod::Crosshair))
+    Ok(draw_pointer(frame, x, y))
 }
 
-/// Draw the high-contrast crosshair at a point in frame coordinates.  Used
-/// both as the X11 fallback when XFixes has no usable image and as the
-/// Wayland overlay, where the backend tracks the virtual pointer itself.
-/// Returns false when the point is outside the frame.
+/// Draw a pointer at frame coordinates: the vendored Posy arrow when it is
+/// available, otherwise the high-contrast crosshair.  Returns the method that
+/// actually landed in the frame, or `None` when the point is outside it.
+pub fn draw_pointer(frame: &mut Frame, x: i32, y: i32) -> Option<CursorMethod> {
+    if draw_cursor(frame, x, y) {
+        return Some(CursorMethod::Image);
+    }
+    if draw_crosshair(frame, x, y) {
+        return Some(CursorMethod::Crosshair);
+    }
+    None
+}
+
+/// Blend the vendored cursor image with its hotspot at `(x, y)`.  The image
+/// is straight-alpha RGBA, so ordinary source-over blending applies.
+pub fn draw_cursor(frame: &mut Frame, x: i32, y: i32) -> bool {
+    let Some(image) = crate::cursor::default_cursor() else {
+        return false;
+    };
+    let left = x - image.hotspot.0;
+    let top = y - image.hotspot.1;
+    let mut drawn = false;
+    for row in 0..image.height as i32 {
+        let py = top + row;
+        if py < 0 || py >= frame.height as i32 {
+            continue;
+        }
+        for col in 0..image.width as i32 {
+            let px = left + col;
+            if px < 0 || px >= frame.width as i32 {
+                continue;
+            }
+            let src = ((row as u32 * image.width + col as u32) * 4) as usize;
+            let alpha = image.rgba[src + 3] as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let offset = ((py as u32 * frame.width + px as u32) * 4) as usize;
+            for channel in 0..3 {
+                let dst = frame.rgba[offset + channel] as u32;
+                frame.rgba[offset + channel] =
+                    ((image.rgba[src + channel] as u32 * alpha + dst * (255 - alpha)) / 255) as u8;
+            }
+            frame.rgba[offset + 3] = 255;
+            drawn = true;
+        }
+    }
+    drawn
+}
+
+/// Draw the high-contrast crosshair at a point in frame coordinates.  This is
+/// the last-resort fallback when the vendored cursor image cannot be decoded
+/// or drawn.  Returns false when the point is outside the frame.
 pub fn draw_crosshair(frame: &mut Frame, x: i32, y: i32) -> bool {
     if x < 0 || y < 0 || x >= frame.width as i32 || y >= frame.height as i32 {
         return false;
@@ -794,6 +841,18 @@ mod tests {
         let halo = ((14 * 32 + 17) * 4) as usize;
         assert!(big.rgba[halo] < 140);
         assert!(!draw_crosshair(&mut big, 40, 40));
+    }
+
+    #[test]
+    fn vendored_cursor_draws_at_the_hotspot() {
+        let mut big = Frame {
+            width: 64,
+            height: 64,
+            rgba: vec![0; 64 * 64 * 4],
+        };
+        assert_eq!(draw_pointer(&mut big, 4, 4), Some(CursorMethod::Image));
+        assert!(big.rgba.chunks(4).any(|pixel| pixel[3] > 0));
+        assert_eq!(draw_pointer(&mut big, 100, 100), None);
     }
 }
 

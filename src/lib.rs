@@ -10,6 +10,7 @@ pub mod a11y;
 pub mod backend;
 pub mod clipboard;
 pub mod control;
+pub mod cursor;
 pub mod display;
 pub mod env;
 pub mod input;

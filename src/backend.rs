@@ -456,9 +456,11 @@ impl Backend {
                 let mut cursor_drawn = false;
                 if cursor {
                     if let Some((x, y)) = pointer {
-                        if screenshot::draw_crosshair(&mut frame, x - origin.0, y - origin.1) {
+                        if let Some(method) =
+                            screenshot::draw_pointer(&mut frame, x - origin.0, y - origin.1)
+                        {
                             cursor_drawn = true;
-                            cursor_method = Some(screenshot::CursorMethod::Crosshair);
+                            cursor_method = Some(method);
                         }
                     }
                 }

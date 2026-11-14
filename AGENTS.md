@@ -10,3 +10,5 @@ This repository is an MCP server plus a human-facing desktop viewer.
   `display_stop` or `kill_process all=true`.
 - A running headless session can be shown to a person by attaching the viewer;
   it does not need to be restarted as `visible=true`.
+- `assets/cursors/posy/` is CC BY-NC 4.0, not MIT. Keep its README and LICENSE
+  with the asset, and do not describe the whole tree as MIT-only.

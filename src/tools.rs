@@ -91,7 +91,7 @@ pub fn definitions() -> Vec<Value> {
                         "additionalProperties": false
                     },
                     "window_id": { "description": "Capture this window instead of the root (id from list_windows; opaque x11:/wl: handles and bare X11 ids are accepted)", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
-                    "cursor": { "type": "boolean", "description": "Overlay the nested pointer (default true; pass false to omit). X11 uses the XFixes cursor image with a crosshair fallback. Wayland requests the compositor cursor and draws a crosshair from the last virtual-pointer position, because headless sway does not composite the cursor and per-window capture never includes it. cursor_drawn/cursor_note report whether a marker was actually drawn." },
+                    "cursor": { "type": "boolean", "description": "Overlay the nested pointer (default true; pass false to omit). X11 uses the XFixes cursor image when available, otherwise the vendored Posy arrow (with a crosshair fallback). Wayland requests the compositor cursor and draws the Posy arrow from the last virtual-pointer position, because headless sway does not composite the cursor and per-window capture never includes it. cursor_drawn/cursor_note report whether a marker was actually drawn." },
                     "grid": { "type": "boolean", "description": "Overlay a 100 px coordinate grid (default false)" },
                     "marks": { "type": "boolean", "description": "Draw numbered boxes around actionable accessibility elements and record their centers for click(mark=N) (default false)" },
                     "mark_limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Maximum numbered elements when marks=true (default 60)" },
@@ -988,7 +988,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             let cursor_note = if cursor && !cursor_drawn {
                 Some(match (backend_kind, kind) {
                     (BackendKind::Wayland, "window") => {
-                        "per-window Wayland capture never includes the compositor cursor; a crosshair appears once the pointer is inside the window (move/click)"
+                        "per-window Wayland capture never includes the compositor cursor; the arrow appears once the pointer is inside the window (move/click)"
                     }
                     (BackendKind::Wayland, _) => {
                         "the pointer is outside the captured area or has not moved yet, so no cursor was drawn"

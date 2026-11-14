@@ -527,6 +527,7 @@ struct Viewer {
     layout: Layout,
     aspect_lock: bool,
     cursor: bool,
+    cursor_surface: Option<cairo::ImageSurface>,
     fullscreen: bool,
     pinned: Option<Target>,
     syncing: bool,
@@ -693,6 +694,7 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
         layout: options.layout,
         aspect_lock: options.aspect_lock,
         cursor: options.cursor,
+        cursor_surface: cursor_surface(),
         fullscreen: options.fullscreen,
         pinned: first,
         syncing: false,
@@ -1650,6 +1652,10 @@ impl Viewer {
         let leaves = self.layout_rects(width, height);
         let bsp = self.layout == Layout::Bsp;
         let cursor = self.cursor;
+        let cursor_surface = self.cursor_surface.clone();
+        let cursor_hotspot = crate::cursor::default_cursor()
+            .map(|image| image.hotspot)
+            .unwrap_or((0, 0));
         for (index, pane) in self.panes.iter_mut().enumerate() {
             pane.last_inner = None;
             let leaf = leaves.get(index).copied().unwrap_or(Rect {
@@ -1685,11 +1691,23 @@ impl Viewer {
 
                 if cursor && !bsp {
                     if let Some((x, y)) = pane.pointer {
-                        let px = inner.x as f64
-                            + x as f64 * inner.w as f64 / pane.target.width.max(1) as f64;
-                        let py = inner.y as f64
-                            + y as f64 * inner.h as f64 / pane.target.height.max(1) as f64;
-                        draw_crosshair(context, px, py);
+                        let zoom_x = inner.w as f64 / pane.target.width.max(1) as f64;
+                        let zoom_y = inner.h as f64 / pane.target.height.max(1) as f64;
+                        let px = inner.x as f64 + x as f64 * zoom_x;
+                        let py = inner.y as f64 + y as f64 * zoom_y;
+                        if let Some(surface) = cursor_surface.as_ref() {
+                            let left = px - cursor_hotspot.0 as f64 * zoom_x;
+                            let top = py - cursor_hotspot.1 as f64 * zoom_y;
+                            let _ = context.save();
+                            context.translate(left, top);
+                            context.scale(zoom_x, zoom_y);
+                            let _ = context.set_source_surface(surface, 0.0, 0.0);
+                            context.source().set_filter(cairo::Filter::Bilinear);
+                            let _ = context.paint();
+                            let _ = context.restore();
+                        } else {
+                            draw_crosshair(context, px, py);
+                        }
                     }
                 }
                 inner_rect = Some(inner);
@@ -1929,6 +1947,32 @@ fn draw_crosshair(context: &cairo::Context, x: f64, y: f64) {
     context.rectangle(x - 1.0, y - 1.0, 3.0, 3.0);
     let _ = context.fill();
     let _ = context.restore();
+}
+
+/// Build a Cairo surface from the vendored pointer.  Cairo wants
+/// premultiplied ARGB32 in native byte order, unlike the straight RGBA used by
+/// the screenshot compositor.
+fn cursor_surface() -> Option<cairo::ImageSurface> {
+    let image = crate::cursor::default_cursor()?;
+    if image.rgba.len() < image.width as usize * image.height as usize * 4 {
+        return None;
+    }
+    let mut bgra = Vec::with_capacity(image.rgba.len());
+    for pixel in image.rgba.chunks_exact(4) {
+        let alpha = pixel[3] as u32;
+        bgra.push((pixel[2] as u32 * alpha / 255) as u8);
+        bgra.push((pixel[1] as u32 * alpha / 255) as u8);
+        bgra.push((pixel[0] as u32 * alpha / 255) as u8);
+        bgra.push(alpha as u8);
+    }
+    cairo::ImageSurface::create_for_data(
+        bgra,
+        cairo::Format::ARgb32,
+        image.width as i32,
+        image.height as i32,
+        image.width as i32 * 4,
+    )
+    .ok()
 }
 
 fn image_surface(rgba: &[u8], width: i32, height: i32) -> Option<cairo::ImageSurface> {
