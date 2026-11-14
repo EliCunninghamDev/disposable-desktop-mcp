@@ -196,7 +196,11 @@ The toolbar contains:
 
 - a **session dropdown** listing every live nested desktop;
 - **Single** — show only the selected session;
-- **BSP `N`** — tile up to eight live sessions with a balanced binary split.
+- **BSP `N`** — tile up to eight live sessions with a balanced binary split;
+- **Control** — claim or release human input;
+- **×** — stop the selected session on the server that owns it, after a
+  confirmation prompt. If that server is gone, the viewer reaps the orphaned
+  session itself.
 
 Selecting a session in BSP mode switches back to Single for that session.
 While the agent owns control, the keyboard shortcuts are `q`/`Esc` quit,
@@ -211,6 +215,14 @@ again, or close the viewer. While human control is active every key goes to the
 session, so press `Ctrl+Shift+C` to release and get the shortcuts above back.
 `Ctrl+Shift+Q` closes the viewer while human control is active. Claims are tied
 to the viewer PID, so a crashed viewer cannot lock an agent out.
+
+The **×** button stops the selected session without touching its server: the
+viewer writes a request beside the session state, the owning server picks it up
+within a second and runs the same teardown as `display_stop`, and the pane
+disappears when the state file is gone. A request that no server answers (for
+example after the server was killed) falls back to killing the recorded
+processes and removing the session directory, so the viewer can clean up
+orphans the reaper missed.
 
 The viewer attaches to any running session, headless or visible, so a headless
 desktop can be shown on demand without restarting it. Starting with

@@ -178,18 +178,49 @@ pub async fn serve(manager: Arc<DisplayManager>) -> Result<()> {
     Ok(())
 }
 
-/// Stop a desktop left running by a dead or hung client.  Stdio EOF covers the
-/// normal case; this covers a client that stays connected but never sends
+/// Background maintenance for the session this server owns.  It honors stop
+/// requests from a viewer (which has no RPC channel) and stops desktops left
+/// running by a dead or hung client.  Stdio EOF covers the normal case; the
+/// timeout check covers a client that stays connected but never sends
 /// display_stop, or a session that exceeds its configured lifetime.
 async fn watchdog(manager: Arc<DisplayManager>) {
-    if manager.idle_timeout.is_none() && manager.max_lifetime.is_none() {
-        return;
-    }
+    let mut tick: u64 = 0;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tick += 1;
         let Some(session) = manager.session().await else {
             continue;
         };
+
+        if crate::state::take_stop_request(&session.info.session_id) {
+            eprintln!(
+                "[xephyr-mcp] viewer requested stop of {} ({})",
+                session.info.display, session.info.session_id
+            );
+            let path = crate::trace::path_for(Some(&session.info.session_id));
+            let entry = crate::trace::entry(
+                "viewer_stop",
+                &json!({}),
+                Some(&session.info.session_id),
+                Some(&session.info.display),
+                0,
+                true,
+                None,
+                None,
+                None,
+            );
+            let _ = crate::trace::append(&path, entry);
+            if let Err(err) = manager.stop().await {
+                eprintln!("[xephyr-mcp] viewer stop failed: {err:#}");
+            }
+            continue;
+        }
+
+        // Timeouts are cheap to check; the stop request is the latency-critical
+        // path and runs every second.
+        if tick % 10 != 0 || (manager.idle_timeout.is_none() && manager.max_lifetime.is_none()) {
+            continue;
+        }
         let running_for = std::time::Duration::from_secs(
             crate::state::now().saturating_sub(session.info.started_at),
         );

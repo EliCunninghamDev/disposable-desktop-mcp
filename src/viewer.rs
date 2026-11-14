@@ -18,7 +18,7 @@ use gtk4::{cairo, gdk, glib};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode, Window};
 use x11rb::protocol::xtest;
@@ -164,7 +164,8 @@ OPTIONS:
     --no-aspect-lock      Do not lock the window to the display aspect ratio
     -h, --help            Show this help
 
-The toolbar has a session dropdown, Single/BSP buttons, and a Control toggle.
+The toolbar has a session dropdown, Single/BSP buttons, a Control toggle, and
+an x button that stops the selected session on its server (with confirmation).
 Keys: c claim human control, Ctrl+Shift+C release it (the Control button also
 toggles), q quit, f / F11 fullscreen, t toggle BSP, s cycle sessions.  While
 human control is active every other key, including Esc, is forwarded to the
@@ -501,6 +502,15 @@ struct Pane {
     last_inner: Option<Rect>,
 }
 
+/// A stop request is in flight: the server has been asked to tear the session
+/// down and the viewer is waiting for its state to disappear.
+#[derive(Clone)]
+struct PendingStop {
+    session_id: String,
+    key: String,
+    deadline: Instant,
+}
+
 struct Viewer {
     window: gtk::ApplicationWindow,
     canvas: gtk::DrawingArea,
@@ -508,6 +518,8 @@ struct Viewer {
     single_button: gtk::ToggleButton,
     bsp_button: gtk::ToggleButton,
     control_button: gtk::ToggleButton,
+    stop_button: gtk::Button,
+    pending_stop: Option<PendingStop>,
     sessions: Vec<Target>,
     labels: Vec<String>,
     panes: Vec<Pane>,
@@ -643,6 +655,13 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
     ));
     toolbar.append(&control_button);
 
+    let stop_button = gtk::Button::from_icon_name("window-close-symbolic");
+    stop_button.add_css_class("flat");
+    stop_button.add_css_class("destructive-action");
+    stop_button.set_tooltip_text(Some("Stop the selected session and close its desktop"));
+    stop_button.update_property(&[gtk::accessible::Property::Label("Stop session")]);
+    toolbar.append(&stop_button);
+
     let canvas = gtk::DrawingArea::new();
     canvas.set_hexpand(true);
     canvas.set_vexpand(true);
@@ -665,6 +684,8 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
         single_button: single_button.clone(),
         bsp_button: bsp_button.clone(),
         control_button: control_button.clone(),
+        stop_button: stop_button.clone(),
+        pending_stop: None,
         sessions: Vec::new(),
         labels: Vec::new(),
         panes: Vec::new(),
@@ -857,6 +878,11 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
     }
 
     {
+        let viewer = viewer.clone();
+        stop_button.connect_clicked(move |_| confirm_stop(&viewer));
+    }
+
+    {
         let motion = gtk::EventControllerMotion::new();
         let viewer = viewer.clone();
         motion.connect_motion(move |_, x, y| {
@@ -925,6 +951,18 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
         });
     }
 
+    // Stop requests complete in about a second; poll faster than the session
+    // list refresh so the pane does not linger on a dead display.
+    {
+        let viewer = viewer.clone();
+        glib::timeout_add_local(Duration::from_millis(250), move || {
+            if let Ok(mut viewer) = viewer.try_borrow_mut() {
+                viewer.poll_stop();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
     {
         let mut viewer = viewer.borrow_mut();
         viewer.refresh_sessions();
@@ -945,6 +983,58 @@ fn build_ui(app: &gtk::Application, options: &Options, first: Option<Target>) ->
         });
     }
     Ok(())
+}
+
+/// Ask before closing someone's workspace: the stop button is a teardown, not
+/// a detach.  The request itself is a file next to the session state, because
+/// the viewer has no RPC channel to the server that owns the display.
+fn confirm_stop(viewer: &Rc<RefCell<Viewer>>) {
+    let Ok(ctx) = viewer.try_borrow() else {
+        return;
+    };
+    if !ctx.can_stop() {
+        return;
+    }
+    let Some(target) = ctx.current_target().cloned() else {
+        return;
+    };
+    let Some(session_id) = target
+        .session_id
+        .clone()
+        .filter(|session_id| !session_id.is_empty())
+    else {
+        return;
+    };
+    let window = ctx.window.clone();
+    drop(ctx);
+
+    if let Ok(mut ctx) = viewer.try_borrow_mut() {
+        if ctx.control_owned {
+            let _ = ctx.set_human(false);
+        }
+        ctx.sync_buttons();
+    }
+
+    let dialog = gtk::AlertDialog::builder()
+        .message(format!("Stop session {}?", target.label()))
+        .detail("The nested desktop and every application running in it will be closed.")
+        .buttons(["Cancel", "Stop"])
+        .cancel_button(0)
+        .default_button(0)
+        .build();
+    let viewer = viewer.clone();
+    dialog.choose(
+        Some(&window),
+        None::<&gtk::gio::Cancellable>,
+        move |answer| {
+            if answer != Ok(1) {
+                return;
+            }
+            if let Ok(mut ctx) = viewer.try_borrow_mut() {
+                ctx.begin_stop(&session_id);
+            }
+        },
+    );
 }
 
 fn initial_size(target: &Target, scale: Option<f64>) -> (i32, i32) {
@@ -1315,6 +1405,95 @@ impl Viewer {
         self.panes = panes;
     }
 
+    /// The selected session can be stopped only while it still has a state
+    /// file, which is also the file that names its server.
+    fn can_stop(&self) -> bool {
+        self.current_target()
+            .and_then(|target| target.session_id.as_deref())
+            .filter(|id| !id.is_empty())
+            .map(state::session_path)
+            .map(|path| path.exists())
+            .unwrap_or(false)
+    }
+
+    fn begin_stop(&mut self, session_id: &str) {
+        if let Some(state) = state::read_session(session_id) {
+            // A dead server cannot honor a request; reap the orphan here so
+            // the viewer can clean up what the server left behind.
+            if !crate::proc::alive(state.server_pid) {
+                state::reap_session(&state);
+                self.pinned = self
+                    .pinned
+                    .take()
+                    .filter(|target| target.session_id.as_deref() != Some(session_id));
+                self.refresh_sessions();
+                return;
+            }
+        }
+        match state::request_stop(session_id) {
+            Ok(()) => {
+                self.pending_stop = Some(PendingStop {
+                    session_id: session_id.to_string(),
+                    key: self
+                        .current_target()
+                        .map(|target| target.key())
+                        .unwrap_or_default(),
+                    deadline: Instant::now() + Duration::from_secs(6),
+                });
+                self.sync_buttons();
+                self.update_title();
+            }
+            Err(err) => self.show_error("Could not stop the session", &format!("{err:#}")),
+        }
+    }
+
+    /// Called on a fast timer while a stop request is in flight.
+    fn poll_stop(&mut self) {
+        let Some(pending) = self.pending_stop.clone() else {
+            return;
+        };
+        match state::read_session(&pending.session_id) {
+            None => self.finish_stop(&pending),
+            Some(state) if !crate::proc::alive(state.server_pid) => {
+                state::reap_session(&state);
+                self.finish_stop(&pending);
+            }
+            Some(_) if Instant::now() >= pending.deadline => {
+                self.pending_stop = None;
+                self.sync_buttons();
+                self.update_title();
+                self.show_error(
+                    "The session did not stop",
+                    "Its server did not answer the request. Use display_stop from the agent, or close the server process.",
+                );
+            }
+            Some(_) => {}
+        }
+    }
+
+    fn finish_stop(&mut self, pending: &PendingStop) {
+        self.pending_stop = None;
+        if self
+            .pinned
+            .as_ref()
+            .is_some_and(|target| target.key() == pending.key)
+        {
+            // Otherwise the pinned target would be re-added to the session
+            // list forever and the pane would keep showing a dead display.
+            self.pinned = None;
+        }
+        self.refresh_sessions();
+    }
+
+    fn show_error(&self, message: &str, detail: &str) {
+        let dialog = gtk::AlertDialog::builder()
+            .message(message)
+            .detail(detail)
+            .buttons(["OK"])
+            .build();
+        dialog.show(Some(&self.window));
+    }
+
     fn sync_buttons(&mut self) {
         self.syncing = true;
         self.single_button.set_active(self.layout == Layout::Single);
@@ -1336,6 +1515,15 @@ impl Viewer {
             self.bsp_button
                 .set_tooltip_text(Some("Tile every live session (up to 8)"));
         }
+        let can_stop = self.can_stop();
+        self.stop_button
+            .set_sensitive(can_stop && self.pending_stop.is_none());
+        self.stop_button
+            .set_tooltip_text(Some(match (can_stop, &self.pending_stop) {
+                (false, _) => "No session with a state file is selected",
+                (true, Some(_)) => "Waiting for the session to stop",
+                (true, None) => "Stop the selected session and close its desktop",
+            }));
         self.syncing = false;
     }
 
@@ -1415,8 +1603,13 @@ impl Viewer {
         } else {
             ""
         };
+        let stopping = self.pending_stop.as_ref().is_some_and(|pending| {
+            self.current_target()
+                .is_some_and(|target| target.key() == pending.key)
+        });
+        let stopping = if stopping { " [stopping]" } else { "" };
         self.window.set_title(Some(&format!(
-            "xephyr mcp viewer - {label} ({width}x{height}){suffix}{control}"
+            "xephyr mcp viewer - {label} ({width}x{height}){suffix}{control}{stopping}"
         )));
     }
 

@@ -146,19 +146,58 @@ pub fn list_sessions() -> Vec<State> {
     states
 }
 
+/// File the viewer writes to ask the owning server to stop a session.  The
+/// viewer has no RPC channel to the server, so this is the only request it
+/// makes that changes server state.
+pub fn stop_request_path(session_id: &str) -> PathBuf {
+    sessions_dir().join(format!("{session_id}.stop"))
+}
+
+pub fn request_stop(session_id: &str) -> Result<()> {
+    if session_id.is_empty() {
+        anyhow::bail!("cannot stop a session without an id");
+    }
+    let path = stop_request_path(session_id);
+    if let Some(parent) = path.parent() {
+        crate::env::create_private_dir(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    std::fs::write(&path, b"stop\n").with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(())
+}
+
+/// Consume a pending stop request.  Returns true once; the file is removed so
+/// a restart cannot replay it.
+pub fn take_stop_request(session_id: &str) -> bool {
+    let path = stop_request_path(session_id);
+    if !path.exists() {
+        return false;
+    }
+    let _ = std::fs::remove_file(&path);
+    true
+}
+
 /// Remove a session's state file.  If current.json pointed at it, point it at
 /// the newest remaining live session instead of leaving a dangling display.
 pub fn clear(session_id: &str) {
+    if session_id.is_empty() {
+        return;
+    }
     let _ = std::fs::remove_file(session_path(session_id));
+    let _ = std::fs::remove_file(stop_request_path(session_id));
+    crate::control::clear(session_id);
     let current_is_ours = read_current()
         .map(|state| state.session_id == session_id)
         .unwrap_or(false);
     if !current_is_ours {
         return;
     }
+    // list_sessions() includes current.json itself, so the session being
+    // cleared must be excluded or it is written straight back and the stale
+    // file outlives the display.
     let replacement = list_sessions()
         .into_iter()
-        .find(|state| crate::proc::alive(state.server_pid));
+        .find(|state| state.session_id != session_id && crate::proc::alive(state.server_pid));
     match replacement {
         Some(state) => {
             let _ = write_atomic(&crate::env::state_file(), &state);
@@ -244,6 +283,39 @@ pub fn kill_runtime_dir(runtime_dir: &Path) {
     }
 }
 
+/// Tear down everything a session left behind: the processes named by its
+/// state, anything else still carrying its private runtime directory, that
+/// directory itself, its control claim, and the state file.  The caller must
+/// have established that the owning server is gone (or be shutting it down).
+pub fn reap_session(state: &State) -> Vec<String> {
+    let mut notes = Vec::new();
+    let mut groups = Vec::new();
+    for pid in &state.pids {
+        if process_is_nested_display(*pid, state) {
+            groups.push(*pid);
+            notes.push(format!("stopped stale {} (pid {pid})", state.display));
+        }
+    }
+    if !groups.is_empty() {
+        for pid in &groups {
+            crate::proc::kill_group(*pid, libc::SIGTERM);
+            crate::proc::signal_process(*pid, libc::SIGTERM);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        for pid in &groups {
+            crate::proc::kill_group(*pid, libc::SIGKILL);
+            crate::proc::signal_process(*pid, libc::SIGKILL);
+        }
+    }
+    // Catch children that escaped the original process groups.
+    if !state.runtime_dir.is_empty() {
+        kill_runtime_dir(Path::new(&state.runtime_dir));
+        let _ = std::fs::remove_dir_all(&state.runtime_dir);
+    }
+    clear(&state.session_id);
+    notes
+}
+
 /// Kill leftovers from a previous server that died without running its
 /// cleanup.  Only touches processes whose command line still names the old
 /// nested display, so PID reuse cannot hit an unrelated process.
@@ -254,33 +326,49 @@ pub fn cleanup_stale() -> Vec<String> {
         if crate::proc::alive(state.server_pid) {
             continue;
         }
-        if seen_displays.contains(&state.display) {
+        if !state.display.is_empty() && seen_displays.contains(&state.display) {
+            // A live session already owns this display.  Its PIDs may now
+            // belong to the new owner, so only shed this dead server's
+            // private tree instead of signalling anything.
+            if !state.runtime_dir.is_empty() {
+                let _ = std::fs::remove_dir_all(&state.runtime_dir);
+            }
             clear(&state.session_id);
             continue;
         }
-        seen_displays.push(state.display.clone());
+        if !state.display.is_empty() {
+            seen_displays.push(state.display.clone());
+        }
+        notes.extend(reap_session(&state));
+    }
+    notes.extend(sweep_orphan_requests());
+    notes
+}
 
-        let mut groups = Vec::new();
-        for pid in &state.pids {
-            if process_is_nested_display(*pid, &state) {
-                groups.push(*pid);
-                notes.push(format!("stopped stale {} (pid {pid})", state.display));
-            }
+/// Drop stop/control files whose session is gone.  A crashed server or viewer
+/// leaves these behind, and nothing else ever reads them.
+fn sweep_orphan_requests() -> Vec<String> {
+    let mut notes = Vec::new();
+    let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
+        return notes;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let session_id = name
+            .strip_suffix(".control.json")
+            .or_else(|| name.strip_suffix(".stop"));
+        let Some(session_id) = session_id else {
+            continue;
+        };
+        if session_id.is_empty() || session_path(session_id).exists() {
+            continue;
         }
-        if !groups.is_empty() {
-            for pid in &groups {
-                crate::proc::kill_group(*pid, libc::SIGTERM);
-                crate::proc::signal_process(*pid, libc::SIGTERM);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            for pid in &groups {
-                crate::proc::kill_group(*pid, libc::SIGKILL);
-                crate::proc::signal_process(*pid, libc::SIGKILL);
-            }
+        if std::fs::remove_file(&path).is_ok() {
+            notes.push(format!("removed orphan {name}"));
         }
-        // Catch children that escaped the original process groups.
-        kill_runtime_dir(Path::new(&state.runtime_dir));
-        clear(&state.session_id);
     }
     notes
 }
@@ -314,6 +402,21 @@ mod tests {
         assert_eq!(state.control, "agent");
         assert!(state.wayland_display.is_none());
         assert!(state.capabilities.is_none());
+    }
+
+    #[test]
+    fn stop_request_round_trips_once() {
+        let id = format!("test-stop-{}", std::process::id());
+        assert!(!take_stop_request(&id));
+        request_stop(&id).unwrap();
+        assert!(stop_request_path(&id).exists());
+        assert!(take_stop_request(&id));
+        assert!(!take_stop_request(&id));
+    }
+
+    #[test]
+    fn stop_request_rejects_an_empty_id() {
+        assert!(request_stop("").is_err());
     }
 
     #[test]
