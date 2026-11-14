@@ -73,7 +73,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "screenshot",
-            "Capture the nested desktop as a PNG. Without options this captures the full root window downscaled to max_width/max_height; set region or window_id to crop at native resolution, and cursor/grid/marks to overlay the pointer, a 100 px grid, or numbered accessibility targets. Marks also records the mapping so click(mark=N) can target an element. The text block reports display/image dimensions, crop origin, scale, and the mark list.",
+            "Capture the nested desktop as a PNG. Without options this captures the full root window downscaled to max_width/max_height; set region or window_id to crop at native resolution. The nested pointer is overlaid by default (pass cursor=false to omit it), and grid/marks add a 100 px grid or numbered accessibility targets. Marks also records the mapping so click(mark=N) can target an element. The text block reports display/image dimensions, crop origin, scale, cursor status, and the mark list.",
             schema(
                 json!({
                     "max_width": { "type": "integer", "minimum": 64, "maximum": 4096, "description": "Maximum returned image width (default 1280; ignored with native=true)" },
@@ -91,7 +91,7 @@ pub fn definitions() -> Vec<Value> {
                         "additionalProperties": false
                     },
                     "window_id": { "description": "Capture this window instead of the root (id from list_windows; opaque x11:/wl: handles and bare X11 ids are accepted)", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
-                    "cursor": { "type": "boolean", "description": "Overlay the nested pointer where the backend supports it (X11 XFixes, Wayland output capture); window captures report cursor_drawn=false (default false)" },
+                    "cursor": { "type": "boolean", "description": "Overlay the nested pointer (default true; pass false to omit). X11 uses the XFixes cursor image with a crosshair fallback. Wayland requests the compositor cursor and draws a crosshair from the last virtual-pointer position, because headless sway does not composite the cursor and per-window capture never includes it. cursor_drawn/cursor_note report whether a marker was actually drawn." },
                     "grid": { "type": "boolean", "description": "Overlay a 100 px coordinate grid (default false)" },
                     "marks": { "type": "boolean", "description": "Draw numbered boxes around actionable accessibility elements and record their centers for click(mark=N) (default false)" },
                     "mark_limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Maximum numbered elements when marks=true (default 60)" },
@@ -869,6 +869,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             let session = active(manager).await?;
             let region = args.get("region").map(wait::parse_region).transpose()?;
             let backend = session.backend();
+            let backend_kind = backend.kind();
             let capabilities = backend.capabilities();
             let handle = match args.get("window_id") {
                 Some(Value::Null) | None => None,
@@ -881,7 +882,9 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                     backend.kind().as_str()
                 ));
             }
-            let cursor = opt_bool(args, "cursor").unwrap_or(false);
+            // Agents reason about the pointer position from screenshots, so
+            // show it unless the caller explicitly opts out.
+            let cursor = opt_bool(args, "cursor").unwrap_or(true);
             let grid = opt_bool(args, "grid").unwrap_or(false);
             let marks_requested = opt_bool(args, "marks").unwrap_or(false);
             let mark_limit = opt_u64(args, "mark_limit").unwrap_or(60).clamp(1, 200) as u32;
@@ -980,6 +983,21 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
             }
             let origin_x = origin.map(|(x, _)| x).unwrap_or(0);
             let origin_y = origin.map(|(_, y)| y).unwrap_or(0);
+            // Tell the agent when it cannot see a pointer in the image, so it
+            // does not assume an overlay was drawn off-screen or unsupported.
+            let cursor_note = if cursor && !cursor_drawn {
+                Some(match (backend_kind, kind) {
+                    (BackendKind::Wayland, "window") => {
+                        "per-window Wayland capture never includes the compositor cursor; a crosshair appears once the pointer is inside the window (move/click)"
+                    }
+                    (BackendKind::Wayland, _) => {
+                        "the pointer is outside the captured area or has not moved yet, so no cursor was drawn"
+                    }
+                    _ => "the pointer is outside the captured area, so no cursor was drawn",
+                })
+            } else {
+                None
+            };
             let metadata = json!({
                 "display": session.info.display,
                 "capture": kind,
@@ -1002,6 +1020,7 @@ async fn dispatch(manager: &DisplayManager, name: &str, args: &Value) -> Result<
                 "cursor_overlay": cursor,
                 "cursor_drawn": cursor_drawn,
                 "cursor_method": cursor_method.map(|method| format!("{method:?}").to_lowercase()),
+                "cursor_note": cursor_note,
                 "grid_overlay": grid,
                 "marks_requested": marks_requested,
                 "mark_count": mark_list_count(&marks_value),

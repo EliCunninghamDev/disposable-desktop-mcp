@@ -40,6 +40,11 @@ never used.
   cursor/grid/marks overlays, and downscaling apply to either backend.
   `screenshot window_id=` captures a single window even when another window
   covers it.
+- **Pointer visible to the agent.** `screenshot` overlays the nested pointer by
+  default: the XFixes cursor image on X11 (with a high-contrast crosshair
+  fallback on Xvfb), and on Wayland a crosshair at the last virtual-pointer
+  position. Headless sway does not composite its cursor, and per-window capture
+  never includes it. Pass `cursor=false` to omit the marker.
 - **Input that never reaches the host.** X11 uses XTEST on the nested server;
   Wayland uses compositor virtual pointer and keyboard devices. Mouse
   moves/clicks/drags, scrolling, typing, Unicode text, held keys, and key combos
@@ -84,7 +89,7 @@ are kept.
 | Clipboard | X `CLIPBOARD` owner | `zwlr_data_control_v1` |
 | Resize display | XRandR (Xephyr only) | `output <name> mode` |
 | Move/resize windows | any window | floating windows only |
-| Cursor in window capture | yes (XFixes) | no (`cursor_drawn: false`) |
+| Cursor in window capture | yes (XFixes) | crosshair from the virtual pointer |
 
 Capabilities are reported per session by `display_start`, so a tool can check
 support instead of guessing from the backend name. Host input can still reach a
@@ -304,7 +309,8 @@ tools return a clear error and the rest of the server keeps working.
   a visible Xephyr window directly. A nested Wayland session can park its host
   devices on a `locked` seat instead.
 - Wayland windows are moved/resized only while floating; tiled windows return an
-  error. Per-window capture never includes the compositor cursor.
+  error. Per-window capture never includes the compositor cursor; the backend
+  draws a crosshair from the last virtual-pointer position instead.
 - `launch` runs arbitrary shell commands inside the nested desktop. Treat the
   MCP server as trusted local tooling.
 - Software rendering (GTK's Cairo renderer) is used automatically on hosts

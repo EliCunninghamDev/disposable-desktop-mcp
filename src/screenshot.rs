@@ -379,6 +379,7 @@ pub fn overlay_cursor(
             let base_x = i32::from(reply.x) - i32::from(reply.xhot) - origin_x;
             let base_y = i32::from(reply.y) - i32::from(reply.yhot) - origin_y;
 
+            let mut drawn = false;
             for (index, pixel) in reply.cursor_image.iter().enumerate() {
                 let alpha = (pixel >> 24) & 0xff;
                 if alpha == 0 {
@@ -397,8 +398,16 @@ pub fn overlay_cursor(
                         ((source * alpha + dst * (255 - alpha)) / 255) as u8;
                 }
                 frame.rgba[offset + 3] = 255;
+                drawn = true;
             }
-            return Ok(Some(CursorMethod::Xfixes));
+            if drawn {
+                return Ok(Some(CursorMethod::Xfixes));
+            }
+            // The cursor image was reported at a position outside the frame
+            // (common for window captures).  A crosshair is only drawn when
+            // the queried pointer is actually inside, which also keeps
+            // cursor_drawn honest.
+            return fallback_crosshair(&conn, frame, origin_x, origin_y);
         }
     }
 
@@ -415,14 +424,41 @@ fn fallback_crosshair(
     let pointer = conn.query_pointer(root)?.reply()?;
     let x = i32::from(pointer.root_x) - origin_x;
     let y = i32::from(pointer.root_y) - origin_y;
-    if x < 0 || y < 0 || x >= frame.width as i32 || y >= frame.height as i32 {
+    if !draw_crosshair(frame, x, y) {
         return Ok(None);
     }
+    Ok(Some(CursorMethod::Crosshair))
+}
+
+/// Draw the high-contrast crosshair at a point in frame coordinates.  Used
+/// both as the X11 fallback when XFixes has no usable image and as the
+/// Wayland overlay, where the backend tracks the virtual pointer itself.
+/// Returns false when the point is outside the frame.
+pub fn draw_crosshair(frame: &mut Frame, x: i32, y: i32) -> bool {
+    if x < 0 || y < 0 || x >= frame.width as i32 || y >= frame.height as i32 {
+        return false;
+    }
     let arm = 9i32;
+    // Dark halo: keeps the light arms legible on white windows and light
+    // themes, while the bright core still stands out on dark backgrounds.
+    for offset in -arm..=arm {
+        for (px, py) in [
+            (x + offset, y - 1),
+            (x + offset, y),
+            (x + offset, y + 1),
+            (x - 1, y + offset),
+            (x, y + offset),
+            (x + 1, y + offset),
+        ] {
+            if px >= 0 && py >= 0 && px < frame.width as i32 && py < frame.height as i32 {
+                blend(frame, px as u32, py as u32, (18, 18, 18), 0.8);
+            }
+        }
+    }
     for offset in -arm..=arm {
         for (px, py) in [(x + offset, y), (x, y + offset)] {
             if px >= 0 && py >= 0 && px < frame.width as i32 && py < frame.height as i32 {
-                blend(frame, px as u32, py as u32, (255, 255, 255), 0.85);
+                blend(frame, px as u32, py as u32, (255, 255, 255), 0.95);
             }
         }
     }
@@ -435,7 +471,7 @@ fn fallback_crosshair(
             }
         }
     }
-    Ok(Some(CursorMethod::Crosshair))
+    true
 }
 
 /// Draw a 100 px coordinate grid over the frame, with stronger lines every
@@ -742,6 +778,22 @@ mod tests {
         let before = hash(&other);
         other.rgba[0] ^= 0xff;
         assert_ne!(before, hash(&other));
+    }
+
+    #[test]
+    fn crosshair_draws_a_dark_halo_and_red_center() {
+        let mut big = Frame {
+            width: 32,
+            height: 32,
+            rgba: vec![255; 32 * 32 * 4],
+        };
+        assert!(draw_crosshair(&mut big, 16, 16));
+        let center = ((16 * 32 + 16) * 4) as usize;
+        assert!(big.rgba[center] > 200);
+        assert!(big.rgba[center + 1] < 120);
+        let halo = ((14 * 32 + 17) * 4) as usize;
+        assert!(big.rgba[halo] < 140);
+        assert!(!draw_crosshair(&mut big, 40, 40));
     }
 }
 

@@ -225,6 +225,10 @@ pub struct WaylandInput {
     keymap: KeymapKind,
     width: u32,
     height: u32,
+    /// Last absolute position requested through the virtual pointer.  Wayland
+    /// has no global cursor query, so this is what screenshot overlays use
+    /// when the compositor does not composite its cursor.
+    last_pointer: Option<(u32, u32)>,
     /// Mask from modifier-only key_down calls.
     held_mods: u32,
     /// key_down calls that include a non-modifier key.
@@ -276,6 +280,7 @@ impl WaylandInput {
             keymap: KeymapKind::Base,
             width: width.max(1),
             height: height.max(1),
+            last_pointer: None,
             held_mods: 0,
             held_keys: HashMap::new(),
             held_syms: HashMap::new(),
@@ -289,6 +294,12 @@ impl WaylandInput {
     pub fn set_extent(&mut self, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
+    }
+
+    /// Last position sent through the virtual pointer, in output coordinates.
+    /// `None` until the first move, click, button, drag, or scroll.
+    pub fn pointer_position(&self) -> Option<(u32, u32)> {
+        self.last_pointer
     }
 
     fn pointer(&self) -> Result<&ZwlrVirtualPointerV1> {
@@ -407,6 +418,7 @@ impl WaylandInput {
     pub fn move_to(&mut self, x: i32, y: i32) -> Result<Value> {
         self.pump()?;
         let (cx, cy) = self.clamp_point(x, y);
+        self.last_pointer = Some((cx, cy));
         self.pointer()?
             .motion_absolute(now_ms(), cx, cy, self.width, self.height);
         self.pointer()?.frame();
@@ -459,6 +471,7 @@ impl WaylandInput {
     ) -> Result<Value> {
         self.pump()?;
         let (cx, cy) = self.clamp_point(x, y);
+        self.last_pointer = Some((cx, cy));
         self.pointer()?
             .motion_absolute(now_ms(), cx, cy, self.width, self.height);
         self.pointer()?.frame();
@@ -505,6 +518,7 @@ impl WaylandInput {
         self.pump()?;
         if let Some((x, y)) = at {
             let (cx, cy) = self.clamp_point(x, y);
+            self.last_pointer = Some((cx, cy));
             self.pointer()?
                 .motion_absolute(now_ms(), cx, cy, self.width, self.height);
             self.pointer()?.frame();
@@ -536,6 +550,7 @@ impl WaylandInput {
         self.pump()?;
         let code = Self::button_code(button)?;
         let (fx, fy) = self.clamp_point(from.0, from.1);
+        self.last_pointer = Some((fx, fy));
         self.pointer()?
             .motion_absolute(now_ms(), fx, fy, self.width, self.height);
         self.pointer()?.frame();
@@ -549,6 +564,7 @@ impl WaylandInput {
             let x = from.0 + (to.0 - from.0) * step as i32 / steps as i32;
             let y = from.1 + (to.1 - from.1) * step as i32 / steps as i32;
             let (cx, cy) = self.clamp_point(x, y);
+            self.last_pointer = Some((cx, cy));
             self.pointer()?
                 .motion_absolute(now_ms(), cx, cy, self.width, self.height);
             self.pointer()?.frame();
@@ -573,6 +589,7 @@ impl WaylandInput {
         self.pump()?;
         if let Some((x, y)) = at {
             let (cx, cy) = self.clamp_point(x, y);
+            self.last_pointer = Some((cx, cy));
             self.pointer()?
                 .motion_absolute(now_ms(), cx, cy, self.width, self.height);
             self.pointer()?.frame();
@@ -928,6 +945,14 @@ pub fn shared(
     let input = Arc::new(Mutex::new(WaylandInput::connect(&socket, width, height)?));
     guard.insert(socket, input.clone());
     Ok(input)
+}
+
+/// Return the live input connection without creating one.  Read-only callers
+/// such as the screenshot cursor overlay must not instantiate a virtual
+/// pointer just to ask where it is.
+pub fn existing(runtime_dir: &Path, display: &str) -> Option<Arc<Mutex<WaylandInput>>> {
+    let socket = runtime_dir.join(display);
+    registry().lock().ok()?.get(&socket).cloned()
 }
 
 /// Drop the input connection when its session stops.  Closing the protocol

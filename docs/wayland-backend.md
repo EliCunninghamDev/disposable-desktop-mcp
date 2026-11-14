@@ -272,7 +272,8 @@ The source returns the client surface, which for client-side-decorated toolkits
 the backend center-crops the frame back to that geometry before returning it.
 The origin therefore stays `(window.x, window.y)`, and marks/click coordinates
 line up with the image. Clients without shadows (alacritty, XWayland) need no
-crop. Cursors are not composited into window captures (`cursor_drawn: false`).
+crop. Cursors are not composited into window captures; the backend draws a crosshair
+from the last virtual-pointer position when it falls inside the window.
 
 ### Input passthrough and the nested window
 
@@ -322,10 +323,13 @@ Consequences:
 
 ### Cursor capture
 
-`wlr-screencopy` can include the compositor cursor on the output copy; verify
-whether sway 1.12 honors the overlay-cursor flag under the pixman renderer. If
-not, draw the cursor from the last known pointer position (the server already
-tracks it) instead of XFixes. Do not assume `GetCursorImage` has an analog.
+`wlr-screencopy` can include the compositor cursor on the output copy, and
+`screenshot` asks for it by default; pass `cursor=false` to omit the marker.
+Under the pixman renderer (notably headless sway) that flag is ignored, and
+per-window capture never includes the compositor cursor, so the backend tracks
+the last position sent through `zwlr_virtual_pointer_v1` and draws a crosshair
+there. The marker is absent until the pointer has been moved by `move`,
+`click`, `mouse_down`/`mouse_up`, `drag`, or `scroll`.
 
 ### Stale cleanup
 

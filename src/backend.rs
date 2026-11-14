@@ -404,10 +404,15 @@ impl Backend {
                 },
                 target,
             ) => {
-                let (frame, cursor_drawn) = match target {
+                let pointer = if cursor {
+                    self.pointer_position()
+                } else {
+                    None
+                };
+                let (mut frame, origin) = match target {
                     CaptureTarget::Output => (
                         wayland::capture(runtime_dir, display, Some(self.output()), cursor)?,
-                        cursor,
+                        (0, 0),
                     ),
                     CaptureTarget::Region(rect) => (
                         screenshot::crop(
@@ -417,7 +422,7 @@ impl Backend {
                             rect.width,
                             rect.height,
                         )?,
-                        cursor,
+                        (rect.x.max(0), rect.y.max(0)),
                     ),
                     CaptureTarget::Window(handle) => {
                         let id = handle.wayland_number().ok_or_else(|| {
@@ -440,12 +445,26 @@ impl Backend {
                             window.width.max(1) as u32,
                             window.height.max(1) as u32,
                         )?;
-                        (frame, false)
+                        (frame, (window.x, window.y))
                     }
                 };
+                // Headless sway under the pixman renderer ignores the
+                // overlay-cursor flag, and per-window capture never has a
+                // compositor cursor at all.  The virtual pointer is ours, so
+                // draw its last known position unless the caller opted out.
+                let mut cursor_method = None;
+                let mut cursor_drawn = false;
+                if cursor {
+                    if let Some((x, y)) = pointer {
+                        if screenshot::draw_crosshair(&mut frame, x - origin.0, y - origin.1) {
+                            cursor_drawn = true;
+                            cursor_method = Some(screenshot::CursorMethod::Crosshair);
+                        }
+                    }
+                }
                 Ok(CaptureResult {
                     cursor_drawn,
-                    cursor_method: None,
+                    cursor_method,
                     frame,
                 })
             }
@@ -675,6 +694,23 @@ impl Backend {
             .lock()
             .map_err(|_| anyhow!("the Wayland input state is poisoned"))?;
         guard.scroll(at, up, amount)
+    }
+
+    /// Last position sent through the Wayland virtual pointer, in display
+    /// coordinates.  X11 uses XFixes/query_pointer instead.
+    pub fn pointer_position(&self) -> Option<(i32, i32)> {
+        match self {
+            Self::Wayland {
+                runtime_dir,
+                display,
+                ..
+            } => {
+                let input = wl_input::existing(runtime_dir, display)?;
+                let guard = input.lock().ok()?;
+                guard.pointer_position().map(|(x, y)| (x as i32, y as i32))
+            }
+            Self::X11 { .. } => None,
+        }
     }
 
     /// Forward a viewer key event by keysym.  X11 viewers use XTEST directly;
