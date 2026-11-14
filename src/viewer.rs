@@ -1277,7 +1277,7 @@ impl Viewer {
                 Backend::Wayland { .. } => pane
                     .target
                     .backend
-                    .capture(&CaptureTarget::Output, true)
+                    .capture(&CaptureTarget::Output, self.cursor)
                     .map(|capture| (capture.frame, None)),
             };
             match captured {
